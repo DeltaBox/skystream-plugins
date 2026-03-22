@@ -1,0 +1,21 @@
+[
+  {
+    "packageName": "delta.sky.lk21",
+    "name": "LK21",
+    "version": 1,
+    "baseUrl": "https://tv9.lk21official.cc",
+    "description": "Lk21 Layarkaca21 movie and series streaming",
+    "authors": [
+      "delta"
+    ],
+    "languages": [
+      "id",
+      "en"
+    ],
+    "categories": [
+      "Movie",
+      "TvSeries"
+    ],
+    "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/delta.sky.lk21.sky"
+  }
+]
