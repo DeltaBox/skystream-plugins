@@ -306,6 +306,45 @@
         }
     };
 
+    async function resolveStreamUrl(url, depth = 0) {
+        if (depth > 3 || !url || url.includes("about:blank")) return null;
+        
+        try {
+            const res = await request(url);
+            const html = res.body || "";
+            const doc = parseHtml(html);
+
+            // Check for iframe
+            const ifr = doc.querySelector("iframe[src]");
+            if (ifr) {
+                const src = normalizeUrl(getAttr(ifr, "src"), url);
+                if (src && src !== url) return await resolveStreamUrl(src, depth + 1);
+            }
+
+            // Check for meta refresh
+            const meta = doc.querySelector("meta[http-equiv=refresh]");
+            if (meta) {
+                const content = getAttr(meta, "content");
+                const refreshUrl = content.split(/URL=/i)[1]?.trim();
+                if (refreshUrl) {
+                    const next = normalizeUrl(refreshUrl, url);
+                    if (next && next !== url) return await resolveStreamUrl(next, depth + 1);
+                }
+            }
+
+            // Check for script location.href
+            const jsMatch = html.match(/location\.href\s*=\s*["']([^"']+)["']/i);
+            if (jsMatch && jsMatch[1]) {
+                const next = normalizeUrl(jsMatch[1], url);
+                if (next && next !== url) return await resolveStreamUrl(next, depth + 1);
+            }
+
+            return url;
+        } catch (_) {
+            return url;
+        }
+    }
+
     globalThis.loadStreams = async function(url, cb) {
         try {
             const doc = await loadDoc(url);
@@ -325,24 +364,31 @@
             for (const ifr of iframes) {
                 const src = normalizeUrl(getAttr(ifr, "src"), manifest.baseUrl);
                 if (src) {
-                    addStream(new StreamResult({
-                        url: src,
-                        source: "Embed",
-                        quality: "Auto"
-                    }));
+                    const resolved = await resolveStreamUrl(src);
+                    if (resolved) {
+                        addStream(new StreamResult({
+                            url: resolved,
+                            source: "Player",
+                            quality: "Auto"
+                        }));
+                    }
                 }
             }
 
             // Extract from dooplay player options
             const options = Array.from(doc.querySelectorAll("li.dooplay_player_option[data-url]"));
             for (const opt of options) {
-                const serverUrl = getAttr(opt, "data-url");
-                if (serverUrl) {
-                    addStream(new StreamResult({
-                        url: serverUrl,
-                        source: textOf(opt.querySelector("span.title")) || "Server",
-                        quality: "Auto"
-                    }));
+                const rawUrl = getAttr(opt, "data-url");
+                if (rawUrl) {
+                    // Try to resolve if it's a wrapper
+                    const resolved = await resolveStreamUrl(rawUrl);
+                    if (resolved) {
+                        addStream(new StreamResult({
+                            url: resolved,
+                            source: textOf(opt.querySelector("span.title")) || "Server",
+                            quality: "Auto"
+                        }));
+                    }
                 }
             }
 
@@ -351,11 +397,14 @@
             for (const a of downloads) {
                 const href = normalizeUrl(getAttr(a, "href"), manifest.baseUrl);
                 if (href) {
-                    addStream(new StreamResult({
-                        url: href,
-                        source: "Download",
-                        quality: "Auto"
-                    }));
+                    const resolved = await resolveStreamUrl(href);
+                    if (resolved) {
+                        addStream(new StreamResult({
+                            url: resolved,
+                            source: "Download",
+                            quality: "Auto"
+                        }));
+                    }
                 }
             }
 
