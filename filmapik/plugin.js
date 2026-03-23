@@ -76,6 +76,18 @@
         return t.trim();
     }
 
+    function safeParseFloat(text) {
+        if (!text) return undefined;
+        const v = parseFloat(String(text).replace(/,/g, "."));
+        return isNaN(v) ? undefined : v;
+    }
+
+    function safeParseInt(text) {
+        if (!text) return undefined;
+        const v = parseInt(text, 10);
+        return isNaN(v) ? undefined : v;
+    }
+
     async function request(url, headers = BASE_HEADERS) {
         return http_get(url, { headers });
     }
@@ -227,20 +239,25 @@
             );
             const posterUrl = normalizeUrl(getAttr(doc.querySelector(".sheader .poster img, .poster img"), "src"), manifest.baseUrl);
             const description = textOf(doc.querySelector("div[itemprop=description], .wp-content, .entry-content, .desc, .entry")) || "Tidak ada deskripsi.";
-            const year = parseInt(textOf(doc.querySelector("#info .info-more .country a")) || "", 10) || undefined;
-            const rating = parseFloat(textOf(doc.querySelector("#repimdb strong")) || "") || undefined;
+            
+            const yearText = textOf(doc.querySelector("#info .info-more .country a"));
+            const year = safeParseInt(yearText);
+            
+            const ratingText = textOf(doc.querySelector("#repimdb strong"));
+            const score = safeParseFloat(ratingText);
+            
             const tags = Array.from(doc.querySelectorAll("span.sgeneros a")).map(textOf);
             
             const actors = Array.from(doc.querySelectorAll(".info-more span.tagline"))
                 .filter(el => /Actors|Stars/i.test(textOf(el)))
-                .flatMap(el => Array.from(el.querySelectorAll("a")).map(textOf));
+                .flatMap(el => Array.from(el.querySelectorAll("a")).map(a => ({ name: textOf(a) })));
 
             const seasonBlocks = Array.from(doc.querySelectorAll("#seasons .se-c"));
             const episodes = [];
 
             if (seasonBlocks.length > 0) {
                 seasonBlocks.forEach((block, sIdx) => {
-                    const seasonNum = parseInt(textOf(block.querySelector(".se-q .se-t"))?.replace(/\D/g, "") || "", 10) || (sIdx + 1);
+                    const seasonNum = safeParseInt(textOf(block.querySelector(".se-q .se-t"))?.replace(/\D/g, "")) || (sIdx + 1);
                     const epNodes = Array.from(block.querySelectorAll(".se-a ul.episodios li a"));
                     epNodes.forEach((ep, eIdx) => {
                         const epUrl = normalizeUrl(getAttr(ep, "href"), manifest.baseUrl);
@@ -278,9 +295,9 @@
                 contentType: type,
                 episodes,
                 year,
-                score: rating,
+                score,
                 tags,
-                actors
+                cast: actors
             });
 
             cb({ success: true, data: item });
@@ -310,7 +327,7 @@
                 if (src) {
                     addStream(new StreamResult({
                         url: src,
-                        name: "Embed",
+                        source: "Embed",
                         quality: "Auto"
                     }));
                 }
@@ -323,7 +340,7 @@
                 if (serverUrl) {
                     addStream(new StreamResult({
                         url: serverUrl,
-                        name: textOf(opt.querySelector("span.title")) || "Server",
+                        source: textOf(opt.querySelector("span.title")) || "Server",
                         quality: "Auto"
                     }));
                 }
@@ -336,7 +353,7 @@
                 if (href) {
                     addStream(new StreamResult({
                         url: href,
-                        name: "Download",
+                        source: "Download",
                         quality: "Auto"
                     }));
                 }
