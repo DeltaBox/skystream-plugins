@@ -126,6 +126,76 @@
         return t.trim();
     }
 
+    function fixImageQuality(url) {
+        if (!url) return "";
+        return url.replace(/-(\d+)x(\d+)\.(jpe?g|png|webp)$/i, ".$3");
+    }
+
+    async function resolveRecursive(url, depth = 0) {
+        if (depth > 3 || !url) return url;
+        try {
+            const res = await request(url);
+            const body = res.body || "";
+            const doc = parseHtml(body);
+
+            // 1. Check for iframe
+            const ifr = doc.querySelector("iframe[src]");
+            if (ifr) {
+                const src = normalizeUrl(getAttr(ifr, "src"), url);
+                if (src && src !== url && src.startsWith("http")) return await resolveRecursive(src, depth + 1);
+            }
+
+            // 2. Check for meta refresh
+            const meta = doc.querySelector("meta[http-equiv=refresh]");
+            if (meta) {
+                const content = getAttr(meta, "content") || "";
+                const m = content.match(/url=(.+)$/i);
+                if (m && m[1]) {
+                    const next = normalizeUrl(m[1].trim(), url);
+                    if (next && next !== url) return await resolveRecursive(next, depth + 1);
+                }
+            }
+
+            // 3. Check for location.href in scripts
+            const scriptMatch = body.match(/location\.href\s*=\s*["'](.*?)["']/);
+            if (scriptMatch && scriptMatch[1]) {
+                const next = normalizeUrl(scriptMatch[1], url);
+                if (next && next !== url) return await resolveRecursive(next, depth + 1);
+            }
+
+            return res.finalUrl || res.url || url;
+        } catch (_) {
+            return url;
+        }
+    }
+
+    async function resolveBuzzHeavier(url, label = "BuzzServer") {
+        try {
+            const res = await request(url);
+            const doc = parseHtml(res.body);
+            const qualityText = textOf(doc.querySelector("div.max-w-2xl > span"));
+            const quality = extractQuality(qualityText);
+
+            // Get redirect from /download
+            const downloadUrl = url.replace(/\/+$/, "") + "/download";
+            const resDl = await http_get(downloadUrl, {
+                headers: { "Referer": url, "User-Agent": UA }
+            });
+
+            // hx-redirect is often in headers
+            const redirectUrl = extractHeader(resDl.headers, "hx-redirect");
+            if (redirectUrl) {
+                return [new StreamResult({
+                    url: redirectUrl,
+                    quality: quality,
+                    source: `${label} - ${quality}`,
+                    headers: { "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
     function extractQuality(text) {
         const t = String(text || "").toLowerCase();
         if (t.includes("2160") || t.includes("4k")) return "4K";
@@ -152,6 +222,7 @@
     }
 
     async function request(url, headers = BASE_HEADERS) {
+        // console.log("HTTP GET:", url);
         return http_get(url, { headers });
     }
 
@@ -195,8 +266,11 @@
         const title = cleanTitle(rawTitle);
         if (!title || title === "Unknown") return null;
 
-        const posterUrl = normalizeUrl(getAttr(img, "src", "data-src", "data-lazy-src"), manifest.baseUrl);
+        const posterUrl = fixImageQuality(normalizeUrl(getAttr(img, "src", "data-src", "data-lazy-src"), manifest.baseUrl));
         
+        const scoreText = textOf(el.querySelector("div.rating, .imdb, .tmdb, .score"));
+        const score = safeParseFloat(scoreText);
+
         const postLabel = textOf(el.querySelector("span.post"));
         let type = "movie";
         if (
@@ -212,7 +286,8 @@
             url: href,
             posterUrl,
             type,
-            contentType: type
+            contentType: type,
+            score
         });
     }
 
@@ -311,7 +386,7 @@
             const title = cleanTitle(
                 textOf(doc.querySelector("h1[itemprop=name], .sheader h1, .sheader h2, #info h2"))
             );
-            const posterUrl = normalizeUrl(getAttr(doc.querySelector(".sheader .poster img, .poster img"), "src"), manifest.baseUrl);
+            const posterUrl = fixImageQuality(normalizeUrl(getAttr(doc.querySelector(".sheader .poster img, .poster img"), "src"), manifest.baseUrl));
             const description = textOf(doc.querySelector("div[itemprop=description], .wp-content, .entry-content, .desc, .entry")) || "Tidak ada deskripsi.";
             
             const yearText = textOf(doc.querySelector("#info .info-more .country a"));
@@ -439,12 +514,25 @@
         return p;
     }
 
-    async function resolveEfekStream(url, label = "VIP SERVER") {
+    async function resolveEfekStream(url, label = "VIP SERVER", referer = "") {
         try {
-            const res = await request(url, { "User-Agent": UA, "Referer": manifest.baseUrl + "/" });
+            const res = await request(url, { "User-Agent": UA, "Referer": referer || manifest.baseUrl + "/" });
             const html = res.body || "";
-            
-            // Look for packed script
+            // console.log("EfekStream HTML head:", html.substring(0, 500));
+            const sourcesMatch = html.match(/sources\s*:\s*(\[[\s\S]*?\])/);
+            if (sourcesMatch) {
+                try {
+                    const sources = JSON.parse(sourcesMatch[1].replace(/'/g, '"'));
+                    return sources.map(s => new StreamResult({
+                        url: resolveUrl(url, s.file),
+                        quality: s.label || "Auto",
+                        source: `${label} - ${s.label || "Auto"}`,
+                        headers: { "Referer": url, "User-Agent": UA }
+                    }));
+                } catch (_) {}
+            }
+
+            // 2. Look for packed script
             const packerMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{([\s\S]*?)\}\(([\s\S]*?)\)\)/);
             if (packerMatch) {
                 const argsRaw = packerMatch[2];
@@ -474,35 +562,90 @@
                         }));
                     }
                     if (streams.length > 0) return streams;
+
+                    // Try to find m3u8 in unpacked
+                    const m3u8Match = unpacked.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
+                    if (m3u8Match) {
+                        return [new StreamResult({
+                            url: m3u8Match[1],
+                            quality: "Auto",
+                            source: label,
+                            headers: { "Referer": url, "User-Agent": UA }
+                        })];
+                    }
                 }
             }
 
-            // Fallback to direct regex if not packed
-            const sources = html.match(/sources\s*:\s*\[([\s\S]*?)\]/);
-            if (sources) {
-                const list = sources[1].matchAll(/file\s*:\s*["']([^"']+)["']/g);
-                const results = [];
-                for (const m of list) {
-                    results.push(new StreamResult({
-                        url: resolveUrl(url, m[1]),
-                        quality: "Auto",
-                        source: label,
-                        headers: { "Referer": url, "User-Agent": UA }
-                    }));
-                }
-                return results;
+            // 3. Look for any m3u8 in the page
+            const m3u8Match = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
+            if (m3u8Match) {
+                return [new StreamResult({
+                    url: m3u8Match[1],
+                    quality: "Auto",
+                    source: label,
+                    headers: { "Referer": url, "User-Agent": UA }
+                })];
             }
 
             return [];
         } catch (_) { return []; }
     }
 
-    async function resolvePlayerLink(playerLink, label) {
+    async function resolveHydrax(url, label = "Hydrax") {
+        try {
+            const res = await request(url);
+            const html = res.body || "";
+            
+            // Hydrax usually has a slug or id in the URL or in the script
+            // Some versions use a 'slug' and 'key' to fetch from an API
+            const slugMatch = html.match(/slug\s*:\s*["']([^"']+)["']/i);
+            const keyMatch = html.match(/key\s*:\s*["']([^"']+)["']/i);
+            
+            if (slugMatch && keyMatch) {
+                // If we found slug/key, we might need to hit their API
+                // For now, let's try to find direct sources in the html
+                const sourcesMatch = html.match(/sources\s*:\s*(\[[\s\S]*?\])/);
+                if (sourcesMatch) {
+                    try {
+                        const sources = JSON.parse(sourcesMatch[1].replace(/'/g, '"'));
+                        return sources.map(s => new StreamResult({
+                            url: s.file,
+                            quality: s.label || "Auto",
+                            source: `${label} - ${s.label || "Auto"}`,
+                            headers: { "Referer": url, "User-Agent": UA }
+                        }));
+                    } catch (_) {}
+                }
+            }
+
+            // Fallback: look for any .m3u8 or .mp4 in the page
+            const m3u8Match = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
+            if (m3u8Match) {
+                return [new StreamResult({
+                    url: m3u8Match[1],
+                    quality: "Auto",
+                    source: label,
+                    headers: { "Referer": url, "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
+    async function resolvePlayerLink(playerLink, label, referer = "") {
         const embed = playerLink || "";
         if (!embed || embed.includes("about:blank")) return [];
 
         if (embed.includes("efek.stream")) {
-            return await resolveEfekStream(embed, label);
+            return await resolveEfekStream(embed, label, referer);
+        }
+
+        if (embed.includes("buzzheavier.com")) {
+            return await resolveBuzzHeavier(embed, label);
+        }
+
+        if (embed.includes("short.icu") || embed.includes("abysscdn") || embed.includes("hydrax")) {
+            return await resolveHydrax(embed, label || "Hydrax");
         }
 
         const quality = extractQuality(embed);
@@ -564,6 +707,7 @@
 
             // Extract from dooplay player options
             const options = Array.from(doc.querySelectorAll("li.dooplay_player_option[data-url]"));
+            console.log(`Found ${options.length} player options`);
             for (const opt of options) {
                 const rawUrl = getAttr(opt, "data-url");
                 if (rawUrl) {
@@ -575,35 +719,40 @@
                         if (titleEl) label = textOf(titleEl);
                     }
                     
-                    const results = await resolvePlayerLink(rawUrl, label);
+                    const results = await resolvePlayerLink(rawUrl, label, sourceUrl);
                     results.forEach(r => rawStreams.push(r));
                 }
             }
 
-            // Extract from iframes if no options found
-            if (rawStreams.length === 0) {
-                const iframes = Array.from(doc.querySelectorAll("div.pframe iframe[src]"));
-                for (const ifr of iframes) {
-                    const src = normalizeUrl(getAttr(ifr, "src"), manifest.baseUrl);
-                    if (src) {
-                        const results = await resolvePlayerLink(src, "Embed");
-                        results.forEach(r => rawStreams.push(r));
-                    }
+            // Extract from iframes
+            const iframes = Array.from(doc.querySelectorAll("div.pframe iframe[src]"));
+            for (const ifr of iframes) {
+                const rawSrc = normalizeUrl(getAttr(ifr, "src"), manifest.baseUrl);
+                if (rawSrc) {
+                    const src = await resolveRecursive(rawSrc);
+                    const results = await resolvePlayerLink(src, "Embed", sourceUrl);
+                    results.forEach(r => rawStreams.push(r));
                 }
             }
 
             // Extract from download links
             const downloads = Array.from(doc.querySelectorAll("div#download a.myButton[href]"));
             for (const a of downloads) {
-                const href = normalizeUrl(getAttr(a, "href"), manifest.baseUrl);
-                if (href) {
+                const rawHref = normalizeUrl(getAttr(a, "href"), manifest.baseUrl);
+                if (rawHref) {
+                    const href = await resolveRecursive(rawHref);
                     const label = textOf(a).split(/\s+/)[0] || "Download";
-                    rawStreams.push(new StreamResult({
-                        url: href,
-                        source: `Download (${label})`,
-                        quality: extractQuality(href),
-                        headers: { "Referer": sourceUrl, "User-Agent": UA }
-                    }));
+                    const results = await resolvePlayerLink(href, `Download (${label})`, sourceUrl);
+                    if (results.length > 0) {
+                        results.forEach(r => rawStreams.push(r));
+                    } else {
+                        rawStreams.push(new StreamResult({
+                            url: href,
+                            source: `Download (${label})`,
+                            quality: extractQuality(href),
+                            headers: { "Referer": sourceUrl, "User-Agent": UA }
+                        }));
+                    }
                 }
             }
 

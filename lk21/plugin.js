@@ -100,6 +100,11 @@
         return t.trim();
     }
 
+    function fixImageQuality(url) {
+        if (!url) return "";
+        return url.replace(/-(\d+)x(\d+)\.(jpe?g|png|webp)$/i, ".$3");
+    }
+
     function extractQuality(text) {
         const t = String(text || "").toLowerCase();
         if (t.includes("2160") || t.includes("4k")) return "4K";
@@ -173,7 +178,7 @@
 
         if (!title || title.length < 2) return null;
 
-        const posterUrl = normalizeUrl(getAttr(img, "data-src", "data-lazy-src", "src", "data-original"), manifest.baseUrl);
+        const posterUrl = fixImageQuality(normalizeUrl(getAttr(img, "data-src", "data-lazy-src", "src", "data-original"), manifest.baseUrl));
 
         const type = isSeries(rawTitle, href, title) ? "series" : "movie";
 
@@ -817,8 +822,8 @@
                 "Unknown";
 
             const posterUrl =
-                normalizeUrl(getAttr(doc.querySelector('meta[property="og:image"]'), "content"), manifest.baseUrl) ||
-                normalizeUrl(getAttr(doc.querySelector("img"), "data-src", "src"), manifest.baseUrl);
+                fixImageQuality(normalizeUrl(getAttr(doc.querySelector('meta[property="og:image"]'), "content"), manifest.baseUrl) ||
+                normalizeUrl(getAttr(doc.querySelector("img"), "data-src", "src"), manifest.baseUrl));
 
             const description =
                 htmlDecode(getAttr(doc.querySelector('meta[property="og:description"]'), "content")) ||
