@@ -131,11 +131,44 @@
         return url.replace(/-(\d+)x(\d+)\.(jpe?g|png|webp)$/i, ".$3");
     }
 
+    // Normalize query from app input per PLUGIN_WORKFLOW.md
+    function normalizeSearchQuery(query) {
+        let q = String(query || "").trim();
+        // Decode URI encoding
+        try { q = decodeURIComponent(q); } catch (_) {}
+        // Replace + with space
+        q = q.replace(/\+/g, " ");
+        // Trim quoted input
+        q = q.replace(/^["']|["']$/g, "");
+        return q.trim();
+    }
+
+    // Scoring for search results
+    function scoreResult(item, query) {
+        const title = (item.title || "").toLowerCase();
+        const q = query.toLowerCase();
+        const qWords = q.split(/\s+/).filter(w => w.length > 0);
+
+        // Phrase match (highest priority)
+        if (title.includes(q)) return 3;
+
+        // All-token match
+        const allMatch = qWords.every(word => title.includes(word));
+        if (allMatch) return 2;
+
+        // Single-token match
+        const anyMatch = qWords.some(word => title.includes(word));
+        if (anyMatch) return 1;
+
+        return 0;
+    }
+
     async function resolveRecursive(url, depth = 0) {
         if (depth > 3 || !url) return url;
         try {
             const res = await request(url);
             const body = res.body || "";
+            if (isCloudflareBlocked(res, url)) return "";
             const doc = parseHtml(body);
 
             // 1. Check for iframe
@@ -249,7 +282,7 @@
         if (!isTrustedNavigationUrl(href)) return null;
 
         const img = el.querySelector("img[src], img[data-src], img[data-lazy-src]");
-        
+
         const candidates = [
             textOf(titleAnchor),
             textOf(el.querySelector("div.details div.title")),
@@ -262,12 +295,12 @@
             const low = t.toLowerCase();
             return !["movie", "movies", "tvshows", "tv-shows", "tv show", "tv-show"].includes(low);
         }) || "Unknown";
-        
+
         const title = cleanTitle(rawTitle);
         if (!title || title === "Unknown") return null;
 
         const posterUrl = fixImageQuality(normalizeUrl(getAttr(img, "src", "data-src", "data-lazy-src"), manifest.baseUrl));
-        
+
         const scoreText = textOf(el.querySelector("div.rating, .imdb, .tmdb, .score"));
         const score = safeParseFloat(scoreText);
 
@@ -311,7 +344,7 @@
                 const items = Array.from(doc.querySelectorAll("div.items.normal article.item, div.result-item article, article.item"))
                     .map(parseItemFromElement)
                     .filter(Boolean);
-                
+
                 if (items.length === 0 && page > 1) break;
                 all.push(...items);
                 if (all.length >= 36) break;
@@ -345,33 +378,79 @@
         }
     };
 
+    // Layered search per PLUGIN_WORKFLOW.md
     globalThis.search = async function(query, cb) {
         try {
-            const q = encodeURIComponent(query.trim());
-            const endpoints = [
-                `${manifest.baseUrl}/?s=${q}`,
-                `${manifest.baseUrl}/?s=${q}&post_type[]=post&post_type[]=tv`
-            ];
+            const normalizedQuery = normalizeSearchQuery(query);
+            const encoded = encodeURIComponent(normalizedQuery);
+            const plusEncoded = normalizedQuery.replace(/ /g, "+");
+            const dashEncoded = normalizedQuery.replace(/ /g, "-");
 
             const out = [];
             const seen = new Set();
 
-            for (const url of endpoints) {
+            // Layer 1: HTML search URLs in parallel (multiple route shapes)
+            const searchUrls = [
+                `${manifest.baseUrl}/?s=${encoded}`,
+                `${manifest.baseUrl}/?s=${plusEncoded}`,
+                `${manifest.baseUrl}/search.php?s=${encoded}`,
+                `${manifest.baseUrl}/search.php?s=${plusEncoded}`,
+                `${manifest.baseUrl}/search/${encoded}`,
+                `${manifest.baseUrl}/search/${plusEncoded}`,
+                `${manifest.baseUrl}/search/${dashEncoded}`
+            ];
+
+            // Try search URLs in parallel batches
+            for (const url of searchUrls) {
                 try {
                     const doc = await loadSiteDoc(url);
                     const items = Array.from(doc.querySelectorAll("div.result-item article, div.result-item, article.item, div.items article.item"))
                         .map(parseItemFromElement)
                         .filter(Boolean);
-                    
+
                     for (const it of items) {
                         if (!seen.has(it.url)) {
                             seen.add(it.url);
-                            out.push(it);
+                            // Score and add
+                            const score = scoreResult(it, normalizedQuery);
+                            if (score > 0) {
+                                it._score = score;
+                                out.push(it);
+                            }
                         }
                     }
-                    if (out.length > 0) break;
+                    // Early return when valid matches exist
+                    if (out.length >= 10) break;
                 } catch (_) {}
             }
+
+            // Layer 2: Fallback crawl + filter if fast layers fail
+            if (out.length === 0) {
+                const fallbackPaths = ["/", "/movie", "/series", "/latest", "/populer"];
+                for (const path of fallbackPaths) {
+                    try {
+                        const doc = await loadSiteDoc(`${manifest.baseUrl}${path}`);
+                        const items = Array.from(doc.querySelectorAll("div.items.normal article.item, article.item"))
+                            .map(parseItemFromElement)
+                            .filter(Boolean);
+
+                        for (const it of items) {
+                            if (!seen.has(it.url)) {
+                                seen.add(it.url);
+                                const score = scoreResult(it, normalizedQuery);
+                                if (score > 0) {
+                                    it._score = score;
+                                    out.push(it);
+                                }
+                            }
+                        }
+                        if (out.length > 0) break;
+                    } catch (_) {}
+                }
+            }
+
+            // Sort by score (phrase match > all-token > single-token)
+            out.sort((a, b) => (b._score || 0) - (a._score || 0));
 
             cb({ success: true, data: out });
         } catch (e) {
@@ -379,70 +458,203 @@
         }
     };
 
-    globalThis.load = async function(url, cb) {
-        try {
-            const doc = await loadSiteDoc(url);
-            
-            const title = cleanTitle(
-                textOf(doc.querySelector("h1[itemprop=name], .sheader h1, .sheader h2, #info h2"))
-            );
-            const posterUrl = fixImageQuality(normalizeUrl(getAttr(doc.querySelector(".sheader .poster img, .poster img"), "src"), manifest.baseUrl));
-            const description = textOf(doc.querySelector("div[itemprop=description], .wp-content, .entry-content, .desc, .entry")) || "Tidak ada deskripsi.";
-            
-            const yearText = textOf(doc.querySelector("#info .info-more .country a"));
-            const year = safeParseInt(yearText);
-            
-            const ratingText = textOf(doc.querySelector("#repimdb strong"));
-            const score = safeParseFloat(ratingText);
-            
-            const tags = Array.from(doc.querySelectorAll("span.sgeneros a")).map(textOf);
-            
-            const actors = Array.from(doc.querySelectorAll(".info-more span.tagline"))
-                .filter(el => /Actors|Stars/i.test(textOf(el)))
-                .flatMap(el => Array.from(el.querySelectorAll("a")).map(a => ({ name: textOf(a) })));
+    // Resolve interstitial/redirect before parsing detail
+    async function resolveDetailUrl(url) {
+        const resolved = await resolveRecursive(url);
+        if (!resolved || resolved === url) return url;
+        // Ensure redirect target looks like a real title URL
+        if (isContentPath(resolved) && isTrustedNavigationUrl(resolved)) {
+            return resolved;
+        }
+        // Never allow category links to replace detail URL
+        if (pathOf(resolved).includes("/populer") || pathOf(resolved).includes("/category")) {
+            return url;
+        }
+        return resolved;
+    }
 
-            const seasonBlocks = Array.from(doc.querySelectorAll("#seasons .se-c"));
-            const episodes = [];
+    // Parse season payload JSON first, then anchor fallback
+    function parseEpisodesFromSeasonPayload(doc, posterUrl) {
+        const episodes = [];
 
-            if (seasonBlocks.length > 0) {
-                seasonBlocks.forEach((block, sIdx) => {
-                    const seasonNum = safeParseInt(textOf(block.querySelector(".se-q .se-t"))?.replace(/\D/g, "")) || (sIdx + 1);
-                    const epNodes = Array.from(block.querySelectorAll(".se-a ul.episodios li a"));
-                    epNodes.forEach((ep, eIdx) => {
-                        const epUrl = normalizeUrl(getAttr(ep, "href"), manifest.baseUrl);
+        // 1. Parse season payload JSON (e.g., script#season-data) first
+        const seasonScript = doc.querySelector("script#season-data, script#season_data, script[data-name=season]");
+        if (seasonScript) {
+            const content = textOf(seasonScript);
+            if (content) {
+                try {
+                    // Support assignment-style payload wrappers
+                    const jsonMatch = content.match(/(?:var\s+)?seasonData\s*=\s*({[\s\S]*?})\s*;?/i) ||
+                                      content.match(/({[\s\S]*"episodes"[\s\S]*})/i);
+                    if (jsonMatch && jsonMatch[1]) {
+                        const seasonData = JSON.parse(jsonMatch[1]);
+                        if (seasonData && Array.isArray(seasonData.episodes)) {
+                            seasonData.episodes.forEach((ep, idx) => {
+                                const epUrl = normalizeUrl(ep.url || ep.link || "", manifest.baseUrl);
+                                if (epUrl && isTrustedNavigationUrl(epUrl)) {
+                                    episodes.push(new Episode({
+                                        name: ep.title || ep.name || `Episode ${ep.episode || (idx + 1)}`,
+                                        url: epUrl,
+                                        season: ep.season || 1,
+                                        episode: ep.episode || (idx + 1),
+                                        posterUrl
+                                    }));
+                                }
+                            });
+                            if (episodes.length > 0) return episodes;
+                        }
+                    }
+                } catch (_) {}
+            }
+        }
+
+        // 2. Support assignment-style payload wrappers in inline scripts
+        const scripts = Array.from(doc.querySelectorAll("script"));
+        for (const script of scripts) {
+            const content = textOf(script);
+            if (!content) continue;
+
+            // Look for season/episode JSON patterns
+            const jsonMatch = content.match(/({[\s\S]*?(?:season|episode)[\s\S]*?})/i);
+            if (jsonMatch && jsonMatch[1]) {
+                try {
+                    const data = JSON.parse(jsonMatch[1]);
+                    if (data && Array.isArray(data.episodes)) {
+                        data.episodes.forEach((ep, idx) => {
+                            const epUrl = normalizeUrl(ep.url || ep.link || "", manifest.baseUrl);
+                            if (epUrl && isTrustedNavigationUrl(epUrl)) {
+                                episodes.push(new Episode({
+                                    name: ep.title || ep.name || `Episode ${ep.episode || (idx + 1)}`,
+                                    url: epUrl,
+                                    season: ep.season || 1,
+                                    episode: ep.episode || (idx + 1),
+                                    posterUrl
+                                }));
+                            }
+                        });
+                        if (episodes.length > 0) return episodes;
+                    }
+                } catch (_) {}
+            }
+        }
+
+        return episodes;
+    }
+
+    // Anchor fallback with strict matching
+    function parseEpisodesFromAnchors(doc, posterUrl, titleSlug) {
+        const episodes = [];
+        const seasonBlocks = Array.from(doc.querySelectorAll("#seasons .se-c, div.season-block"));
+
+        if (seasonBlocks.length > 0) {
+            seasonBlocks.forEach((block, sIdx) => {
+                const seasonNum = safeParseInt(textOf(block.querySelector(".se-q .se-t"))?.replace(/\D/g, "")) || (sIdx + 1);
+                const epNodes = Array.from(block.querySelectorAll(".se-a ul.episodios li a, .episode-list a"));
+
+                epNodes.forEach((ep, eIdx) => {
+                    const epUrl = normalizeUrl(getAttr(ep, "href"), manifest.baseUrl);
+                    if (!epUrl || !isTrustedNavigationUrl(epUrl)) return;
+
+                    // Strict matching: only accept links that match likely episode patterns
+                    const epPath = pathOf(epUrl);
+                    const isEpisodePattern = /\/episode|ep-\d+|season-\d+|temporada/i.test(epPath);
+
+                    // For fallback anchors, only accept if tied to current title slug
+                    const matchesSlug = titleSlug && epPath.includes(titleSlug);
+
+                    if (isEpisodePattern || matchesSlug) {
                         const epName = textOf(ep) || `Episode ${eIdx + 1}`;
                         episodes.push(new Episode({
                             name: epName,
                             url: epUrl,
                             season: seasonNum,
                             episode: eIdx + 1,
-                            posterUrl: posterUrl
+                            posterUrl
                         }));
-                    });
+                    }
                 });
-            }
+            });
+        }
 
+        return episodes;
+    }
+
+    globalThis.load = async function(url, cb) {
+        try {
+            // Resolve redirect/interstitial safely
+            const resolvedUrl = await resolveDetailUrl(url);
+            const doc = await loadSiteDoc(resolvedUrl);
+
+            const title = cleanTitle(
+                textOf(doc.querySelector("h1[itemprop=name], .sheader h1, .sheader h2, #info h2"))
+            );
+            const posterUrl = fixImageQuality(normalizeUrl(getAttr(doc.querySelector(".sheader .poster img, .poster img"), "src"), manifest.baseUrl));
+            const description = textOf(doc.querySelector("div[itemprop=description], .wp-content, .entry-content, .desc, .entry")) || "Tidak ada deskripsi.";
+
+            const yearText = textOf(doc.querySelector("#info .info-more .country a"));
+            const year = safeParseInt(yearText);
+
+            const ratingText = textOf(doc.querySelector("#repimdb strong"));
+            const score = safeParseFloat(ratingText);
+
+            const tags = Array.from(doc.querySelectorAll("span.sgeneros a")).map(textOf);
+
+            const actors = Array.from(doc.querySelectorAll(".info-more span.tagline"))
+                .filter(el => /Actors|Stars/i.test(textOf(el)))
+                .flatMap(el => Array.from(el.querySelectorAll("a")).map(a => ({ name: textOf(a) })));
+
+            // Extract title slug for episode matching
+            const titleSlug = pathOf(resolvedUrl).split("/").filter(p => p).pop()?.replace(/[^a-z0-9-]/gi, "").toLowerCase() || "";
+
+            let episodes = [];
+
+            // 1. Parse season payload JSON first
+            episodes = parseEpisodesFromSeasonPayload(doc, posterUrl);
+
+            // 2. Anchor fallback with strict matching
             if (episodes.length === 0) {
-                const playUrl = normalizeUrl(getAttr(doc.querySelector("#clickfakeplayer, .fakeplayer a"), "href"), url);
-                episodes.push(new Episode({
-                    name: "Play",
-                    url: playUrl || url,
-                    season: 1,
-                    episode: 1,
-                    posterUrl: posterUrl
-                }));
+                episodes = parseEpisodesFromAnchors(doc, posterUrl, titleSlug);
             }
 
-            const type = seasonBlocks.length > 0 ? "series" : "movie";
+            // 3. If still no episodes, check for movie play button
+            if (episodes.length === 0) {
+                const playUrl = normalizeUrl(getAttr(doc.querySelector("#clickfakeplayer, .fakeplayer a"), "href"), resolvedUrl);
+                if (playUrl && isTrustedNavigationUrl(playUrl)) {
+                    episodes.push(new Episode({
+                        name: "Play",
+                        url: playUrl,
+                        season: 1,
+                        episode: 1,
+                        posterUrl
+                    }));
+                } else {
+                    // Single Play episode for movie
+                    episodes.push(new Episode({
+                        name: "Play",
+                        url: resolvedUrl,
+                        season: 1,
+                        episode: 1,
+                        posterUrl
+                    }));
+                }
+            }
+
+            // Determine type with strong checks
+            const seasonBlocks = doc.querySelectorAll("#seasons .se-c, div.season-block");
+            const hasSeasonPayload = doc.querySelector("script#season-data, script#season_data") !== null;
+            const type = (seasonBlocks.length > 0 || hasSeasonPayload || episodes.length > 1) ? "series" : "movie";
+
+            // Movie must stay movie (single Play episode)
+            const finalEpisodes = type === "movie" && episodes.length === 1 ? episodes : episodes;
 
             const item = new MultimediaItem({
                 title,
-                url,
+                url: resolvedUrl,
                 posterUrl,
                 description,
                 type,
                 contentType: type,
-                episodes,
+                episodes: finalEpisodes,
                 year,
                 score,
                 tags,
@@ -518,89 +730,178 @@
         try {
             const res = await request(url, { "User-Agent": UA, "Referer": referer || manifest.baseUrl + "/" });
             const html = res.body || "";
-            // console.log("EfekStream HTML head:", html.substring(0, 500));
-            const sourcesMatch = html.match(/sources\s*:\s*(\[[\s\S]*?\])/);
-            if (sourcesMatch) {
-                try {
-                    const sources = JSON.parse(sourcesMatch[1].replace(/'/g, '"'));
-                    return sources.map(s => new StreamResult({
-                        url: resolveUrl(url, s.file),
-                        quality: s.label || "Auto",
-                        source: `${label} - ${s.label || "Auto"}`,
-                        headers: { "Referer": url, "User-Agent": UA }
-                    }));
-                } catch (_) {}
-            }
 
-            // 2. Look for packed script
-            const packerMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{([\s\S]*?)\}\(([\s\S]*?)\)\)/);
-            if (packerMatch) {
-                const argsRaw = packerMatch[2];
-                // Very crude extraction of arguments
-                const args = argsRaw.split(',').map(s => s.trim().replace(/^'|'$/g, '').replace(/^"|"$/g, ''));
-                if (args.length >= 4) {
-                    const p = packerMatch[1];
-                    const a = parseInt(args[args.length-4]);
-                    const c = parseInt(args[args.length-3]);
-                    const k = args[args.length-2].split('|');
-                    const e = 0;
-                    const d = {};
-                    const unpacked = unpack(p, a, c, k, e, d);
-                    
-                    // Now find sources in unpacked
-                    const sourceMatches = unpacked.matchAll(/\{['"]?label['"]?:\s*['"]([^'"]+)['"],\s*['"]?type['"]?:\s*['"]([^'"]+)['"],\s*['"]?file['"]?:\s*['"]([^'"]+)['"]/g);
-                    const streams = [];
-                    for (const m of sourceMatches) {
-                        const file = m[3];
-                        const q = m[1];
-                        const streamUrl = resolveUrl(url, file);
-                        streams.push(new StreamResult({
-                            url: streamUrl,
-                            quality: q,
-                            source: `${label} - ${q}`,
-                            headers: { "Referer": url, "User-Agent": UA }
-                        }));
-                    }
-                    if (streams.length > 0) return streams;
+            // 1. Look for direct m3u8/mp4 in page sources
+            const directPatterns = [
+                /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi,
+                /file\s*:\s*["'](https?:\/\/[^"']+\.mp4[^"']*)["']/gi,
+                /url\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi,
+                /src\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi
+            ];
 
-                    // Try to find m3u8 in unpacked
-                    const m3u8Match = unpacked.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
-                    if (m3u8Match) {
+            for (const pattern of directPatterns) {
+                const matches = [...html.matchAll(pattern)];
+                for (const match of matches) {
+                    const candidate = match[1];
+                    if (candidate && !candidate.includes("cdn-cgi")) {
+                        const quality = extractQuality(candidate);
                         return [new StreamResult({
-                            url: m3u8Match[1],
-                            quality: "Auto",
-                            source: label,
+                            url: candidate,
+                            quality,
+                            source: `${label} - ${quality}`,
                             headers: { "Referer": url, "User-Agent": UA }
                         })];
                     }
                 }
             }
 
-            // 3. Look for any m3u8 in the page
-            const m3u8Match = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
-            if (m3u8Match) {
-                return [new StreamResult({
-                    url: m3u8Match[1],
-                    quality: "Auto",
-                    source: label,
-                    headers: { "Referer": url, "User-Agent": UA }
-                })];
+            // 2. Look for sources array in JWPlayer config
+            const sourcesMatch = html.match(/sources\s*:\s*(\[[\s\S]*?\])/);
+            if (sourcesMatch) {
+                try {
+                    const sources = JSON.parse(sourcesMatch[1].replace(/'/g, '"'));
+                    const streams = [];
+                    for (const s of sources) {
+                        if (s.file && (s.file.includes(".m3u8") || s.file.includes(".mp4"))) {
+                            streams.push(new StreamResult({
+                                url: s.file,
+                                quality: s.label || extractQuality(s.file),
+                                source: `${label} - ${s.label || "Auto"}`,
+                                headers: { "Referer": url, "User-Agent": UA }
+                            }));
+                        }
+                    }
+                    if (streams.length > 0) return streams;
+                } catch (_) {}
             }
 
-            return [];
+            // 3. Look for packed script with m3u8
+            const packerMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{([\s\S]*?)\}\(([\s\S]*?)\)\)/);
+            if (packerMatch) {
+                const argsRaw = packerMatch[2];
+                const args = argsRaw.split(',').map(s => s.trim().replace(/^'|'$/g, '').replace(/^"|"$/g, ''));
+                if (args.length >= 4) {
+                    try {
+                        const p = packerMatch[1];
+                        const a = parseInt(args[args.length-4]);
+                        const c = parseInt(args[args.length-3]);
+                        const k = args[args.length-2].split('|');
+                        const unpacked = unpack(p, a, c, k, 0, {});
+                        const m3u8Matches = [...unpacked.matchAll(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi)];
+                        if (m3u8Matches.length > 0) {
+                            const streamUrl = m3u8Matches[0][1];
+                            return [new StreamResult({
+                                url: streamUrl,
+                                quality: extractQuality(streamUrl),
+                                source: label,
+                                headers: { "Referer": url, "User-Agent": UA }
+                            })];
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            // 4. Return download link as fallback - user can download or stream from it
+            return [new StreamResult({
+                url: url,
+                quality: "Auto",
+                source: `${label} (Stream/Download)`,
+                headers: { "Referer": url, "User-Agent": UA }
+            })];
         } catch (_) { return []; }
+    }
+
+    async function resolvePlayerIframe(url) {
+        try {
+            const res = await request(url, {
+                "User-Agent": UA,
+                "Referer": `${manifest.baseUrl}/`
+            });
+            const html = res.body || "";
+            const src = html.match(/<iframe[^>]+src=["']([^"']+)["']/i)?.[1] || "";
+            return normalizeUrl(src, url);
+        } catch (_) {
+            return "";
+        }
+    }
+
+    async function resolveP2P(embedUrl, sourceName = "P2P") {
+        try {
+            const idMatch = embedUrl.match(/[?&]id=([^&#]+)/i);
+            const id = idMatch ? decodeURIComponent(idMatch[1]) : "";
+            if (!id) return [];
+
+            const api = "https://cloud.hownetwork.xyz/api2.php?id=" + encodeURIComponent(id);
+            const body = "r=" + encodeURIComponent("https://playeriframe.sbs/") + "&d=" + encodeURIComponent("playeriframe.sbs");
+
+            const res = await http_post(api, {
+                headers: {
+                    "User-Agent": UA,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://cloud.hownetwork.xyz/"
+                },
+                body
+            });
+
+            const json = JSON.parse(res.body || "{}");
+            const file = json.file;
+            if (!file) return [];
+
+            const quality = extractQuality(file);
+            return [new StreamResult({
+                url: file,
+                quality,
+                source: `${sourceName} - ${quality}`,
+                headers: {
+                    "Referer": "https://cloud.hownetwork.xyz/",
+                    "User-Agent": UA
+                }
+            })];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    async function resolveTurbo(embedUrl, sourceName = "TurboVIP") {
+        try {
+            const res = await request(embedUrl, {
+                "User-Agent": UA,
+                "Referer": "https://playeriframe.sbs/"
+            });
+            const html = res.body || "";
+            const m3u8 =
+                html.match(/(?:urlPlay|data-hash)\s*[=:]\s*["']([^"']+\.m3u8[^"']*)["']/i)?.[1] ||
+                html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i)?.[1] ||
+                "";
+
+            if (!m3u8) return [];
+
+            const quality = extractQuality(m3u8);
+            return [new StreamResult({
+                url: m3u8,
+                quality,
+                source: `${sourceName} - ${quality}`,
+                headers: {
+                    "Referer": embedUrl,
+                    "User-Agent": UA
+                }
+            })];
+        } catch (_) {
+            return [];
+        }
     }
 
     async function resolveHydrax(url, label = "Hydrax") {
         try {
             const res = await request(url);
             const html = res.body || "";
-            
+
             // Hydrax usually has a slug or id in the URL or in the script
             // Some versions use a 'slug' and 'key' to fetch from an API
             const slugMatch = html.match(/slug\s*:\s*["']([^"']+)["']/i);
             const keyMatch = html.match(/key\s*:\s*["']([^"']+)["']/i);
-            
+
             if (slugMatch && keyMatch) {
                 // If we found slug/key, we might need to hit their API
                 // For now, let's try to find direct sources in the html
@@ -633,11 +934,21 @@
     }
 
     async function resolvePlayerLink(playerLink, label, referer = "") {
-        const embed = playerLink || "";
-        if (!embed || embed.includes("about:blank")) return [];
+        const link = playerLink || "";
+        if (!link || link.includes("about:blank")) return [];
 
+        let embed = link;
+        if (link.includes("playeriframe")) {
+            embed = await resolvePlayerIframe(link);
+        }
+
+        if (!embed) return [];
+
+        // For efek.stream, try to get direct m3u8 by fetching with proper headers
         if (embed.includes("efek.stream")) {
-            return await resolveEfekStream(embed, label, referer);
+            const streams = await resolveEfekStream(embed, label, referer);
+            if (streams.length > 0) return streams;
+            // Don't return empty, let it fall through to return the link itself
         }
 
         if (embed.includes("buzzheavier.com")) {
@@ -648,12 +959,21 @@
             return await resolveHydrax(embed, label || "Hydrax");
         }
 
+        if (embed.includes("cloud.hownetwork.xyz/video.php")) {
+            return await resolveP2P(embed, label || "P2P");
+        }
+
+        if (embed.includes("emturbovid") || embed.includes("turbovidhls") || embed.includes("turbovid")) {
+            return await resolveTurbo(embed, label || "TurboVIP");
+        }
+
+        // Direct stream URL or download link (mega.nz, etc)
         const quality = extractQuality(embed);
         return [new StreamResult({
             url: embed,
             quality,
             source: `${label || "Player"} - ${quality}`,
-            headers: { "Referer": manifest.baseUrl + "/", "User-Agent": UA }
+            headers: { "Referer": referer || manifest.baseUrl + "/", "User-Agent": UA }
         })];
     }
 
@@ -703,28 +1023,30 @@
             const doc = loaded.doc;
             const sourceUrl = loaded.sourceUrl || url;
             const rawStreams = [];
-            const seen = new Set();
+            const seenUrls = new Set();
 
-            // Extract from dooplay player options
+            // Extract from dooplay player options (server buttons)
             const options = Array.from(doc.querySelectorAll("li.dooplay_player_option[data-url]"));
-            console.log(`Found ${options.length} player options`);
             for (const opt of options) {
                 const rawUrl = getAttr(opt, "data-url");
                 if (rawUrl) {
-                    // Try to find the server title in the same parent or preceding sibling
+                    // Get server name from parent or sibling elements
                     let label = "Server";
                     const ul = opt.closest("ul");
                     if (ul) {
                         const titleEl = ul.querySelector("span.server_title");
                         if (titleEl) label = textOf(titleEl);
                     }
-                    
+                    // Also try the button text itself
+                    const btnText = textOf(opt.querySelector("button, span"));
+                    if (btnText && btnText.length > 1) label = btnText;
+
                     const results = await resolvePlayerLink(rawUrl, label, sourceUrl);
                     results.forEach(r => rawStreams.push(r));
                 }
             }
 
-            // Extract from iframes
+            // Extract from iframes in pframe div
             const iframes = Array.from(doc.querySelectorAll("div.pframe iframe[src]"));
             for (const ifr of iframes) {
                 const rawSrc = normalizeUrl(getAttr(ifr, "src"), manifest.baseUrl);
@@ -735,7 +1057,7 @@
                 }
             }
 
-            // Extract from download links
+            // Extract from download links section
             const downloads = Array.from(doc.querySelectorAll("div#download a.myButton[href]"));
             for (const a of downloads) {
                 const rawHref = normalizeUrl(getAttr(a, "href"), manifest.baseUrl);
@@ -746,6 +1068,7 @@
                     if (results.length > 0) {
                         results.forEach(r => rawStreams.push(r));
                     } else {
+                        // Add as direct download if no resolver matched
                         rawStreams.push(new StreamResult({
                             url: href,
                             source: `Download (${label})`,
@@ -756,16 +1079,33 @@
                 }
             }
 
+            // Also check for any other iframes in the page that might contain players
+            const allIframes = Array.from(doc.querySelectorAll("iframe[src]"));
+            for (const ifr of allIframes) {
+                const src = normalizeUrl(getAttr(ifr, "src"), manifest.baseUrl);
+                if (src && !src.includes("google") && !src.includes("facebook") && !src.includes("twitter")) {
+                    const resolved = await resolveRecursive(src);
+                    if (resolved.includes("efek.stream") || resolved.includes("buzzheavier") || resolved.includes("hydrax")) {
+                        const results = await resolvePlayerLink(resolved, "Auto", sourceUrl);
+                        results.forEach(r => {
+                            if (!seenUrls.has(r.url)) rawStreams.push(r);
+                        });
+                    }
+                }
+            }
+
+            // Expand HLS variants
             const expanded = [];
             for (const s of rawStreams) {
                 const variants = await expandHlsVariants(s);
                 variants.forEach(v => expanded.push(v));
             }
 
+            // Deduplicate streams by URL
             const final = [];
             for (const s of expanded) {
-                if (s.url && !seen.has(s.url)) {
-                    seen.add(s.url);
+                if (s.url && !seenUrls.has(s.url)) {
+                    seenUrls.add(s.url);
                     final.push(s);
                 }
             }
