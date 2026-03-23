@@ -11,6 +11,7 @@
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": `${manifest.baseUrl}/`
     };
+    const SEARCH_REQ_TIMEOUT_MS = 7000;
 
     const EXCLUDE_PATHS = [
         "/genre", "/country", "/negara", "/tahun", "/year", "/page/",
@@ -119,6 +120,15 @@
     async function loadDoc(url, headers = BASE_HEADERS) {
         const res = await request(url, headers);
         return parseHtml(res.body);
+    }
+
+    function withTimeout(promise, ms, label) {
+        return Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                setTimeout(() => reject(new Error(`TIMEOUT:${label || "request"}`)), ms);
+            })
+        ]);
     }
 
     async function resolveProperLink(url) {
@@ -725,8 +735,8 @@
             };
 
             const quickSeed = await Promise.allSettled([
-                fetchSection("/", 1),
-                fetchSection("/populer", 2)
+                withTimeout(fetchSection("/", 1), SEARCH_REQ_TIMEOUT_MS, "seed-latest"),
+                withTimeout(fetchSection("/populer", 2), SEARCH_REQ_TIMEOUT_MS, "seed-popular")
             ]);
             for (const s of quickSeed) {
                 if (s.status === "fulfilled") aggregated.push(...s.value);
@@ -750,7 +760,10 @@
 
             const runBatch = async (batch) => {
                 const settled = await Promise.allSettled(
-                    batch.map((u) => loadDoc(u, BASE_HEADERS).then((doc) => collectItems(doc)))
+                    batch.map((u) =>
+                        withTimeout(loadDoc(u, BASE_HEADERS), SEARCH_REQ_TIMEOUT_MS, u)
+                            .then((doc) => collectItems(doc))
+                    )
                 );
                 for (const item of settled) {
                     if (item.status !== "fulfilled") continue;
