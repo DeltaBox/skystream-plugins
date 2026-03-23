@@ -2,7 +2,7 @@
   {
     "packageName": "kai.delta.filmapik",
     "name": "FilmApik🎃",
-    "version": 5,
+    "version": 8,
     "baseUrl": "https://filmapik.fitness",
     "description": "Nonton film dan serial terbaru subtitle Indonesia gratis",
     "authors": [
@@ -22,7 +22,7 @@
   {
     "packageName": "kai.delta.lk21",
     "name": "LK21",
-    "version": 2,
+    "version": 3,
     "baseUrl": "https://tv9.lk21official.cc",
     "description": "Lk21 Layarkaca21 movie and series streaming",
     "authors": [
