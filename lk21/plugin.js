@@ -12,8 +12,6 @@
         "Referer": `${manifest.baseUrl}/`
     };
 
-    const SEARCH_API = "https://gudangvape.com/search.php?s=";
-
     const EXCLUDE_PATHS = [
         "/genre", "/country", "/negara", "/tahun", "/year", "/page/",
         "/privacy", "/dmca", "/faq", "/cara-install-vpn", "/request", "/wp-",
@@ -698,7 +696,6 @@
             if (!rawQuery) return cb({ success: true, data: [] });
             const aggregated = [];
             const qPlus = rawQuery.replace(/\s+/g, "+");
-            const qDash = rawQuery.replace(/\s+/g, "-").toLowerCase();
             const normalizedQuery = rawQuery.toLowerCase();
             const tokens = normalizedQuery.split(/\s+/).filter((t) => t.length >= 2);
 
@@ -723,13 +720,13 @@
                 return {
                     matched,
                     all: fallback,
-                    final: (matched.length > 0 ? matched : fallback).slice(0, 30)
+                    final: matched.slice(0, 30)
                 };
             };
 
             const quickSeed = await Promise.allSettled([
                 fetchSection("/", 1),
-                fetchSection("/populer", 1)
+                fetchSection("/populer", 2)
             ]);
             for (const s of quickSeed) {
                 if (s.status === "fulfilled") aggregated.push(...s.value);
@@ -739,50 +736,12 @@
                 return cb({ success: true, data: quickLocal });
             }
 
-            try {
-                const apiRes = await http_get(`${SEARCH_API}${q}`, {
-                    headers: {
-                        "User-Agent": UA,
-                        "Accept": "application/json, text/plain, */*",
-                        "Referer": `${manifest.baseUrl}/`
-                    }
-                });
-                const root = JSON.parse(apiRes.body || "{}");
-                const arr = Array.isArray(root?.data) ? root.data : (Array.isArray(root) ? root : []);
-                const apiItems = arr.map((it) => {
-                    const title = cleanTitle(it?.title || "");
-                    const slug = String(it?.slug || "").trim();
-                    if (!title || !slug) return null;
-                    const type = String(it?.type || "").toLowerCase().includes("series") ? "series" : "movie";
-                    const posterField = String(it?.poster || "").trim();
-                    const poster = posterField
-                        ? (/^https?:\/\//i.test(posterField)
-                            ? posterField
-                            : normalizeUrl(`https://static-jpg.lk21.party/wp-content/uploads/${posterField.replace(/^\/+/, "")}`, manifest.baseUrl))
-                        : "";
-                    return new MultimediaItem({
-                        title,
-                        url: normalizeUrl(slug, manifest.baseUrl),
-                        posterUrl: poster,
-                        type,
-                        contentType: type
-                    });
-                }).filter(Boolean);
-                aggregated.push(...apiItems);
-                const quick = rankResults(apiItems).matched.slice(0, 30);
-                if (quick.length > 0) {
-                    return cb({ success: true, data: quick });
-                }
-            } catch (_) {}
-
             const urls = [
                 `${manifest.baseUrl}/search.php?s=${q}`,
                 `${manifest.baseUrl}/search.php?s=${qPlus}`,
                 `${manifest.baseUrl}/?s=${q}`,
                 `${manifest.baseUrl}/?s=${qPlus}`,
-                `${manifest.baseUrl}/search/${q}`,
-                `${manifest.baseUrl}/search/${qPlus}`,
-                `${manifest.baseUrl}/search/${qDash}`
+                `${manifest.baseUrl}/search/${q}`
             ];
 
             const results = [];
@@ -811,11 +770,11 @@
             }
 
             if (finalResults.length === 0) {
-                const seedSections = ["/movie", "/series", "/latest"];
+                const seedSections = ["/populer", "/movie", "/series"];
                 const seedItems = [];
                 for (const sectionPath of seedSections) {
                     try {
-                        const items = await fetchSection(sectionPath, 1);
+                        const items = await fetchSection(sectionPath, 2);
                         seedItems.push(...items);
                     } catch (_) {}
                     if (seedItems.length >= 80) break;
