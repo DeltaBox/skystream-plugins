@@ -1,25 +1,5 @@
 [
   {
-    "packageName": "kai.delta.filmapik",
-    "name": "FilmApik🎃",
-    "version": 18,
-    "baseUrl": "https://filmapik.fitness",
-    "description": "Nonton film dan serial terbaru subtitle Indonesia gratis",
-    "authors": [
-      "kai"
-    ],
-    "languages": [
-      "id"
-    ],
-    "categories": [
-      "Movie",
-      "TvSeries",
-      "Anime",
-      "AsianDrama"
-    ],
-    "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.filmapik.sky"
-  },
-  {
     "packageName": "kai.delta.lk21",
     "name": "LK21",
     "version": 3,
