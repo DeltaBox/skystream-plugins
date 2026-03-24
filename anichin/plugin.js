@@ -113,6 +113,23 @@
         return htmlDecode((el?.textContent || "").replace(/\s+/g, " ").trim());
     }
 
+    function extractDescription(doc) {
+        if (!doc) return "";
+
+        const block = doc.querySelector("div.entry-content p, div.entry-content, .desc, .entry-content");
+        const blockText = textOf(block);
+        if (blockText) {
+            return blockText
+                .replace(/^sinopsis\s*:?\s*/i, "")
+                .replace(/\s+/g, " ")
+                .trim();
+        }
+
+        const meta = doc.querySelector("meta[name='description'], meta[property='og:description']");
+        const metaText = htmlDecode(getAttr(meta, "content"));
+        return metaText.replace(/\s+/g, " ").trim();
+    }
+
     function getAttr(el, ...attrs) {
         if (!el) return "";
         for (const attr of attrs) {
@@ -336,7 +353,7 @@
 
             const title = cleanTitle(textOf(doc.querySelector("h1.entry-title")));
             const posterUrl = fixImageQuality(normalizeUrl(getAttr(doc.querySelector(".ime img, meta[property='og:image']"), "src", "content"), manifest.baseUrl));
-            const description = textOf(doc.querySelector("div.entry-content, .desc, meta[name='description']"));
+            const description = extractDescription(doc);
 
             let episodes = Array.from(doc.querySelectorAll(".eplister li")).map((ep, idx) => {
                 const a = ep.querySelector("a");
