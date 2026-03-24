@@ -2,7 +2,7 @@
     /**
      * @type {import('@skystream/sdk').Manifest}
      */
-    // var manifest is injected at runtime
+    // manifest is injected at runtime
 
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
@@ -17,12 +17,14 @@
         "/privacy", "/dmca", "/faq", "/request", "/wp-",
         "/author", "/category", "/tag", "/feed", "javascript:"
     ];
+
     const TRUSTED_NAV_HOST_MARKERS = [
         "anichin",
         "layarkaca",
         "lk21"
     ];
 
+    // --- Helpers ---
     function normalizeUrl(url, base) {
         if (!url) return "";
         const raw = String(url).trim();
@@ -132,82 +134,56 @@
         return url.replace(/-(\d+)x(\d+)\.(jpe?g|png|webp)$/i, ".$3");
     }
 
-    // Normalize query from app input per PLUGIN_WORKFLOW.md
+    function extractQuality(text) {
+        const t = String(text || "").toLowerCase();
+        if (t.includes("2160") || t.includes("4k")) return "4K";
+        if (t.includes("1080")) return "1080p";
+        if (t.includes("720")) return "720p";
+        if (t.includes("480")) return "480p";
+        if (t.includes("360")) return "360p";
+        if (t.includes("cam")) return "CAM";
+        if (t.includes("sd")) return "SD";
+        if (t.includes("hd")) return "HD";
+        return "Auto";
+    }
+
     function normalizeSearchQuery(query) {
         let q = String(query || "").trim();
-        // Decode URI encoding
         try { q = decodeURIComponent(q); } catch (_) {}
-        // Replace + with space
         q = q.replace(/\+/g, " ");
-        // Trim quoted input
         q = q.replace(/^["']|["']$/g, "");
         return q.trim();
     }
 
-    // Scoring for search results
     function scoreResult(item, query) {
         const title = (item.title || "").toLowerCase();
         const q = query.toLowerCase();
         const qWords = q.split(/\s+/).filter(w => w.length > 0);
-
-        // Phrase match (highest priority)
         if (title.includes(q)) return 3;
-
-        // All-token match
         const allMatch = qWords.every(word => title.includes(word));
         if (allMatch) return 2;
-
-        // Single-token match
         const anyMatch = qWords.some(word => title.includes(word));
         if (anyMatch) return 1;
-
         return 0;
     }
 
-    async function resolveRecursive(url, depth = 0) {
-        if (depth > 3 || !url) return url;
-        try {
-            const res = await request(url);
-            const body = res.body || "";
-            if (isCloudflareBlocked(res, url)) return "";
-            const doc = await parseHtml(body);
-
-            // 1. Check for iframe
-            const ifr = doc.querySelector("iframe[src]");
-            if (ifr) {
-                const src = normalizeUrl(getAttr(ifr, "src"), url);
-                if (src && src !== url && src.startsWith("http")) return await resolveRecursive(src, depth + 1);
-            }
-
-            // 2. Check for meta refresh
-            const meta = doc.querySelector("meta[http-equiv=refresh]");
-            if (meta) {
-                const content = getAttr(meta, "content") || "";
-                const m = content.match(/url=(.+)$/i);
-                if (m && m[1]) {
-                    const next = normalizeUrl(m[1].trim(), url);
-                    if (next && next !== url) return await resolveRecursive(next, depth + 1);
-                }
-            }
-
-            // 3. Check for location.href in scripts
-            const scriptMatch = body.match(/location\.href\s*=\s*["'](.*?)["']/);
-            if (scriptMatch && scriptMatch[1]) {
-                const next = normalizeUrl(scriptMatch[1], url);
-                if (next && next !== url) return await resolveRecursive(next, depth + 1);
-            }
-
-            return res.finalUrl || res.url || url;
-        } catch (_) {
-            return url;
+    function uniqueByUrl(items) {
+        const out = [];
+        const seen = new Set();
+        for (const it of items) {
+            if (!it || !it.url || seen.has(it.url)) continue;
+            seen.add(it.url);
+            out.push(it);
         }
+        return out;
     }
 
+    // --- Network ---
     async function request(url, headers = BASE_HEADERS) {
         return http_get(url, { headers });
     }
 
-    async function loadSiteDoc(url, headers = BASE_HEADERS) {
+    async function loadDoc(url, headers = BASE_HEADERS) {
         if (!isTrustedNavigationUrl(url)) {
             throw new Error(`BLOCKED_REDIRECT_HOST: ${url}`);
         }
@@ -222,11 +198,14 @@
         return await parseHtml(res.body);
     }
 
+    // --- Parsers ---
     function parseItemFromElement(el) {
-        const anchor = el.querySelector(".bsx a, a[title]");
+        if (!el) return null;
+        
+        const anchor = el.querySelector(".bsx a, a[title], a[href*='episode'], a[href*='season']");
         const href = normalizeUrl(getAttr(anchor, "href"), manifest.baseUrl);
-        if (!href || !isContentPath(href)) return null;
-        if (!isTrustedNavigationUrl(href)) return null;
+        if (!href) return null;
+        if (!isContentPath(href)) return null;
 
         const img = el.querySelector("img");
         const title = cleanTitle(getAttr(anchor, "title") || textOf(el.querySelector(".tt")) || getAttr(img, "alt"));
@@ -235,7 +214,7 @@
         const posterUrl = fixImageQuality(normalizeUrl(getAttr(img, "src", "data-src"), manifest.baseUrl));
 
         let type = "series";
-        const typeText = textOf(el.querySelector(".typez"));
+        const typeText = textOf(el.querySelector(".typez, .type, .status"));
         if (typeText.toLowerCase().includes("movie")) type = "movie";
 
         return new MultimediaItem({
@@ -247,64 +226,89 @@
         });
     }
 
-    function uniqueByUrl(items) {
-        const out = [];
-        const seen = new Set();
-        for (const it of items) {
-            if (!it || !it.url || seen.has(it.url)) continue;
-            seen.add(it.url);
-            out.push(it);
-        }
-        return out;
-    }
-
-    async function fetchSection(path, maxPages = 1) {
+    // --- Fetch Functions ---
+    async function fetchSection(path, maxPages = 1, page = 1) {
         const all = [];
-        for (let page = 1; page <= maxPages; page += 1) {
+        for (let p = page; p <= maxPages; p += 1) {
             try {
-                const url = page <= 1 ? `${manifest.baseUrl}${path}` : `${manifest.baseUrl}${path}page/${page}/`;
-                const doc = await loadSiteDoc(url);
-                const items = Array.from(doc.querySelectorAll("div.listupd article, div.post-show article"))
+                let url;
+                if (p <= 1 && page <= 1) {
+                    url = `${manifest.baseUrl}${path}`;
+                } else {
+                    const hasQuery = path.includes('?');
+                    if (hasQuery) {
+                        url = `${manifest.baseUrl}${path}&page=${p}`;
+                    } else {
+                        url = `${manifest.baseUrl}${path}page=${p}/`;
+                    }
+                }
+                const doc = await loadDoc(url);
+                
+                // Try different selectors based on page structure
+                let items = [];
+                
+                // First try: standard listupd articles
+                items = Array.from(doc.querySelectorAll("div.listupd article"))
                     .map(parseItemFromElement)
                     .filter(Boolean);
+                
+                // Second try: bsx divs (alternative structure)
+                if (items.length === 0) {
+                    items = Array.from(doc.querySelectorAll("div.bsx"))
+                        .map(parseItemFromElement)
+                        .filter(Boolean);
+                }
+                
+                // Third try: any article with anchor
+                if (items.length === 0) {
+                    items = Array.from(doc.querySelectorAll("article"))
+                        .map(parseItemFromElement)
+                        .filter(Boolean);
+                }
 
-                if (items.length === 0 && page > 1) break;
+                if (items.length === 0 && p > 1) break;
                 all.push(...items);
                 if (all.length >= 36) break;
-            } catch (_) {
-                if (page === 1) return [];
+            } catch (e) {
+                if (p === 1) return [];
                 break;
             }
         }
         return uniqueByUrl(all);
     }
 
+    // --- Core Functions ---
     async function getHome(cb) {
         try {
             const sections = [
-                { name: "Rilisan Terbaru", path: "/anime/?order=update" },
-                { name: "Series Ongoing", path: "/anime/?status=ongoing&order=update" },
-                { name: "Series Completed", path: "/anime/?status=completed&order=update" },
-                { name: "Movie", path: "/anime/?type=movie&order=update" }
+                { name: "🔥 Popular", path: "/anime/?order=popular" },
+                { name: "🆕 Latest Updates", path: "/anime/?order=update" },
+                { name: "📺 Ongoing", path: "/anime/?status=ongoing&order=update" },
+                { name: "✅ Completed", path: "/anime/?status=completed&order=update" },
+                { name: "🎬 Movies", path: "/anime/?type=movie&order=update" }
             ];
 
             const data = {};
             for (const sec of sections) {
-                const items = await fetchSection(sec.path);
-                if (items.length > 0) {
-                    data[sec.name] = items;
+                try {
+                    const items = await fetchSection(sec.path, 1, 1);
+                    if (items && items.length > 0) {
+                        data[sec.name] = items.slice(0, 20);
+                    }
+                } catch (e) {
+                    // Skip failed sections
                 }
             }
 
+            // Fallback to homepage if all sections fail
             if (Object.keys(data).length === 0) {
-                // Fallback to homepage
-                const items = await fetchSection("/");
-                if (items.length > 0) data["Terbaru"] = items;
+                const items = await fetchSection("/", 1, 1);
+                if (items && items.length > 0) data["🏠 Terbaru"] = items.slice(0, 20);
             }
 
             cb({ success: true, data });
         } catch (e) {
-            cb({ success: false, message: String(e) });
+            cb({ success: false, errorCode: "HOME_ERROR", message: String(e?.message || e) });
         }
     }
 
@@ -314,7 +318,7 @@
             const encoded = encodeURIComponent(normalizedQuery);
             const url = `${manifest.baseUrl}/?s=${encoded}`;
 
-            const doc = await loadSiteDoc(url);
+            const doc = await loadDoc(url);
             const items = Array.from(doc.querySelectorAll("div.listupd article"))
                 .map(parseItemFromElement)
                 .filter(Boolean);
@@ -324,13 +328,13 @@
 
             cb({ success: true, data: uniqueByUrl(out) });
         } catch (e) {
-            cb({ success: false, message: String(e) });
+            cb({ success: false, errorCode: "SEARCH_ERROR", message: String(e?.message || e) });
         }
     }
 
     async function load(url, cb) {
         try {
-            const doc = await loadSiteDoc(url);
+            const doc = await loadDoc(url);
 
             const title = cleanTitle(textOf(doc.querySelector("h1.entry-title")));
             const posterUrl = fixImageQuality(normalizeUrl(getAttr(doc.querySelector(".ime img, meta[property='og:image']"), "src", "content"), manifest.baseUrl));
@@ -363,10 +367,11 @@
 
             cb({ success: true, data: item });
         } catch (e) {
-            cb({ success: false, message: String(e) });
+            cb({ success: false, errorCode: "LOAD_ERROR", message: String(e?.message || e) });
         }
     }
 
+    // --- Extractors ---
     async function resolveOkRu(url, label = "OK.ru") {
         try {
             const embedUrl = url.replace("/video/", "/videoembed/");
@@ -428,7 +433,6 @@
         try {
             const res = await request(url);
             const html = res.body || "";
-            // Look for eval-packed script or direct m3u8
             const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
             if (evalMatch) {
                 try {
@@ -444,7 +448,6 @@
                     }
                 } catch (_) {}
             }
-            // Fallback: look for direct m3u8 in script
             const m3u8 = html.match(/["'](https?:\/\/[^"']*?\.m3u8[^"']*?)["']/)?.[1];
             if (m3u8) {
                 return [new StreamResult({
@@ -465,7 +468,6 @@
                 "Referer": referer || manifest.baseUrl + "/"
             });
             const html = res.body || "";
-            // Look for m3u8 in script or eval
             const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
             if (evalMatch) {
                 try {
@@ -504,7 +506,6 @@
                 body: `op=embed&file_code=${id}&auto=1`
             });
             const html = res.body || "";
-            // Try to unpack packed JS first
             let script = html;
             const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\){[\s\S]*?}\)/);
             if (packedMatch) {
@@ -525,53 +526,25 @@
         return [];
     }
 
-    function unpackJs(packed) {
-        // Simple unpacker for common eval patterns
-        const paramsMatch = packed.match(/eval\(function\(p,a,c,k,e,d\)\{.*?"(.*?)",(\d+),(\d+),.*?\.split\("\|"\)/);
-        if (!paramsMatch) return packed;
-        const payload = paramsMatch[1];
-        const radix = parseInt(paramsMatch[2], 10);
-        const count = parseInt(paramsMatch[3], 10);
-        const dict = payload.split("|");
-        let result = "";
-        for (let i = 0; i < dict.length; i++) {
-            const key = i.toString(radix);
-            const val = dict[i] || key;
-            result += (val || key) + (i < dict.length - 1 ? "" : "");
-        }
-        return result;
-    }
-
     async function resolveVidguard(url, label = "Vidguard") {
         try {
             const embedUrl = url.replace("/d/", "/e/").replace("/v/", "/e/");
             const res = await request(embedUrl);
             const html = res.body || "";
-            
-            // Find the eval script
             const evalMatch = html.match(/<script[^>]*>([\s\S]*?eval\(function\(p,a,c,k,e,d\)[\s\S]*?\))<\/script>/);
             if (!evalMatch) return [];
-            
             const packed = evalMatch[1];
             let unpacked = "";
-            
-            // Try to unpack
             try {
                 unpacked = unpackJs(packed);
             } catch (_) {
                 return [];
             }
-            
-            // Parse the svg object
             const svgMatch = unpacked.match(/svg\s*=\s*(\{[\s\S]*?\});/);
             if (!svgMatch) return [];
-            
             const svgObj = JSON.parse(svgMatch[1]);
             if (!svgObj.stream) return [];
-            
-            // Decode the stream URL
             const decodedUrl = decodeVidguardStream(svgObj.stream);
-            
             return [new StreamResult({
                 url: decodedUrl,
                 quality: "Auto",
@@ -583,29 +556,34 @@
         }
     }
 
+    function unpackJs(packed) {
+        const paramsMatch = packed.match(/eval\(function\(p,a,c,k,e,d\)\{.*?"(.*?)",(\d+),(\d+),.*?\.split\("\|"\)/);
+        if (!paramsMatch) return packed;
+        const payload = paramsMatch[1];
+        const radix = parseInt(paramsMatch[2], 10);
+        const dict = payload.split("|");
+        let result = "";
+        for (let i = 0; i < dict.length; i++) {
+            const key = i.toString(radix);
+            const val = dict[i] || key;
+            result += (val || key);
+        }
+        return result;
+    }
+
     function decodeVidguardStream(encodedUrl) {
         try {
-            // Extract sig parameter
             const sigMatch = encodedUrl.match(/[?&]sig=([^&]+)/);
             if (!sigMatch) return encodedUrl;
-            
             const sig = sigMatch[1];
-            
-            // Decode: chunk by 2, XOR with 2, convert to chars
             let decoded = "";
             for (let i = 0; i < sig.length; i += 2) {
                 const hex = sig.substring(i, i + 2);
                 const charCode = parseInt(hex, 16) ^ 2;
                 decoded += String.fromCharCode(charCode);
             }
-            
-            // Base64 decode
             decoded = atob(decoded);
-            
-            // Remove padding if needed
             decoded = decoded.replace(/=+$/, "");
-            
-            // Reverse and swap pairs
             let chars = decoded.split("");
             for (let i = 0; i < chars.length - 1; i += 2) {
                 const temp = chars[i];
@@ -613,11 +591,7 @@
                 chars[i + 1] = temp;
             }
             decoded = chars.join("");
-            
-            // Remove last 5 chars
             decoded = decoded.slice(0, -5);
-            
-            // Replace sig in URL with decoded value
             return encodedUrl.replace(sig, decoded);
         } catch (_) {
             return encodedUrl;
@@ -643,7 +617,6 @@
         link = normalizeUrl(link, manifest.baseUrl);
         if (!link.startsWith("http")) return [];
 
-        // Specific Resolvers
         if (link.includes("anichin.stream") || link.includes("rumble.com")) {
             const rumbleId = link.match(/[?&]id=([a-zA-Z0-9]+)/)?.[1] || link.match(/\/embed\/([a-zA-Z0-9]+)/)?.[1];
             const rumbleUrl = rumbleId ? `https://rumble.com/embed/${rumbleId}/` : link;
@@ -660,25 +633,12 @@
         if (link.includes("buzzheavier.com")) return await resolveBuzzHeavier(link, label);
         if (link.includes("efek.stream")) return await resolveEfekStream(link, label, referer);
 
-        const quality = "Auto";
         return [new StreamResult({
-            url: link, quality,
+            url: link,
+            quality: "Auto",
             source: label || "Player",
             headers: { "Referer": referer || manifest.baseUrl + "/", "User-Agent": UA }
         })];
-    }
-
-    function extractQuality(text) {
-        const t = String(text || "").toLowerCase();
-        if (t.includes("2160") || t.includes("4k")) return "4K";
-        if (t.includes("1080")) return "1080p";
-        if (t.includes("720")) return "720p";
-        if (t.includes("480")) return "480p";
-        if (t.includes("360")) return "360p";
-        if (t.includes("cam")) return "CAM";
-        if (t.includes("sd")) return "SD";
-        if (t.includes("hd")) return "HD";
-        return "Auto";
     }
 
     async function expandHlsVariants(stream) {
@@ -734,17 +694,14 @@
 
     async function loadStreams(url, cb) {
         try {
-            const doc = await loadSiteDoc(url);
+            const doc = await loadDoc(url);
             const rawStreams = [];
 
-            // Handle .mobius option elements with base64-encoded values
             const options = Array.from(doc.querySelectorAll(".mobius option, .mirror option"));
             for (const opt of options) {
                 const val = getAttr(opt, "value");
                 if (val && val.length > 5) {
                     const label = textOf(opt) || "Server";
-
-                    // Try to decode base64 (like Kotlin version)
                     let decodedUrl = val;
                     try {
                         const decoded = atob(val);
@@ -765,7 +722,6 @@
                 }
             }
 
-            // Fallback: direct iframe
             if (rawStreams.length === 0) {
                 const ifr = doc.querySelector("iframe[src], .video-content iframe");
                 if (ifr) {
@@ -774,7 +730,6 @@
                 }
             }
 
-            // Expand HLS variants
             const expanded = [];
             for (const s of rawStreams) {
                 try {
@@ -785,7 +740,6 @@
                 }
             }
 
-            // Filter only m3u8/mp4 and deduplicate
             const uniq = [];
             const seen = new Set();
             for (const s of expanded) {
@@ -798,11 +752,11 @@
 
             cb({ success: true, data: uniq });
         } catch (e) {
-            cb({ success: false, message: String(e) });
+            cb({ success: false, errorCode: "STREAM_ERROR", message: String(e?.message || e) });
         }
     }
 
-    // Export functions
+    // Export
     globalThis.getHome = getHome;
     globalThis.search = search;
     globalThis.load = load;
