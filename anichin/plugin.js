@@ -367,13 +367,93 @@
         }
     };
 
+    async function resolveOkRu(url, label = "OK.ru") {
+        try {
+            const embedUrl = url.replace("/video/", "/videoembed/");
+            const res = await request(embedUrl);
+            const html = res.body || "";
+            const cleanHtml = html.replace(/\\&quot;/g, '"').replace(/\\\\/g, "\\");
+            const videosMatch = cleanHtml.match(/"videos":\s*(\[[^\]]*\])/);
+            if (!videosMatch) return [];
+            const videos = JSON.parse(videosMatch[1]);
+            return videos.map(v => {
+                const videoUrl = v.url.startsWith("//") ? `https:${v.url}` : v.url;
+                return new StreamResult({
+                    url: videoUrl,
+                    quality: extractQuality(v.name),
+                    source: `${label} - ${v.name}`,
+                    headers: { "User-Agent": UA }
+                });
+            }).reverse();
+        } catch (_) { return []; }
+    }
+
+    async function resolveDailymotion(url, label = "Dailymotion") {
+        try {
+            const id = url.match(/\/video\/([a-zA-Z0-9]+)/)?.[1] || url.match(/\/embed\/video\/([a-zA-Z0-9]+)/)?.[1] || url.split("video=")[1];
+            if (!id) return [];
+            const metaUrl = `https://www.dailymotion.com/player/metadata/video/${id}`;
+            const res = await request(metaUrl);
+            const json = JSON.parse(res.body || "{}");
+            if (json.qualities && json.qualities.auto) {
+                return [new StreamResult({
+                    url: json.qualities.auto[0].url,
+                    quality: "Auto",
+                    source: label,
+                    headers: { "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
+    async function resolveRumble(url, label = "Rumble") {
+        try {
+            const res = await request(url);
+            const html = res.body || "";
+            const m3u8Match = html.match(/"url":"(https?:\/\/.*?\.m3u8)"/);
+            if (m3u8Match) {
+                return [new StreamResult({
+                    url: m3u8Match[1].replace(/\\\//g, "/"),
+                    quality: "Auto",
+                    source: label,
+                    headers: { "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
+    async function resolveStreamRuby(url, label = "StreamRuby") {
+        try {
+            const id = url.match(/embed-([a-zA-Z0-9]+)\.html/)?.[1];
+            if (!id) return [];
+            const domain = new URL(url).origin;
+            const res = await http_post(`${domain}/dl`, {
+                headers: { "Referer": url, "Content-Type": "application/x-www-form-urlencoded" },
+                body: `op=embed&file_code=${id}&auto=1`
+            });
+            const html = res.body || "";
+            const m3u8 = html.match(/file:\s*"([^"]*?m3u8[^"]*)"/)?.[1];
+            if (m3u8) {
+                return [new StreamResult({
+                    url: m3u8,
+                    quality: "Auto",
+                    source: label,
+                    headers: { "Referer": domain, "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
     async function resolvePlayerLink(playerLink, label, referer = "") {
         let link = playerLink || "";
         if (!link || link.includes("about:blank")) return [];
 
         if (!link.startsWith("http") && !link.startsWith("//") && link.length > 10) {
             try {
-                const decoded = atob(link);
+                const decoded = await atob(link);
                 if (decoded.includes("<iframe")) {
                     const m = decoded.match(/src=["'](.*?)["']/);
                     if (m) link = m[1];
@@ -386,10 +466,23 @@
         link = normalizeUrl(link, manifest.baseUrl);
         if (!link.startsWith("http")) return [];
 
+        // Specific Resolvers
+        if (link.includes("anichin.stream") || link.includes("rumble.com")) {
+            const rumbleId = link.match(/[?&]id=([a-zA-Z0-9]+)/)?.[1] || link.match(/\/embed\/([a-zA-Z0-9]+)/)?.[1];
+            const rumbleUrl = rumbleId ? `https://rumble.com/embed/${rumbleId}/` : link;
+            return await resolveRumble(rumbleUrl, label || "Rumble");
+        }
+        if (link.includes("ok.ru")) return await resolveOkRu(link, label || "OK.ru");
+        if (link.includes("dailymotion.com")) return await resolveDailymotion(link, label || "Dailymotion");
+        if (link.includes("ruby") || link.includes("streamruby") || link.includes("svilla") || link.includes("svanila")) {
+            return await resolveStreamRuby(link, label || "StreamRuby");
+        }
+        if (link.includes("buzzheavier.com")) return await resolveBuzzHeavier(link, label);
+        if (link.includes("efek.stream")) return await resolveEfekStream(link, label, referer);
+
         const quality = "Auto";
         return [new StreamResult({
-            url: link,
-            quality,
+            url: link, quality,
             source: label || "Player",
             headers: { "Referer": referer || manifest.baseUrl + "/", "User-Agent": UA }
         })];
