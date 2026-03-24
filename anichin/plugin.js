@@ -279,7 +279,7 @@
         return uniqueByUrl(all);
     }
 
-    globalThis.getHome = async function(cb) {
+    async function getHome(cb) {
         try {
             const sections = [
                 { name: "Rilisan Terbaru", path: "/anime/?order=update" },
@@ -306,14 +306,14 @@
         } catch (e) {
             cb({ success: false, message: String(e) });
         }
-    };
+    }
 
-    globalThis.search = async function(query, cb) {
+    async function search(query, cb) {
         try {
             const normalizedQuery = normalizeSearchQuery(query);
             const encoded = encodeURIComponent(normalizedQuery);
             const url = `${manifest.baseUrl}/?s=${encoded}`;
-            
+
             const doc = await loadSiteDoc(url);
             const items = Array.from(doc.querySelectorAll("div.listupd article"))
                 .map(parseItemFromElement)
@@ -326,9 +326,9 @@
         } catch (e) {
             cb({ success: false, message: String(e) });
         }
-    };
+    }
 
-    globalThis.load = async function(url, cb) {
+    async function load(url, cb) {
         try {
             const doc = await loadSiteDoc(url);
 
@@ -365,7 +365,7 @@
         } catch (e) {
             cb({ success: false, message: String(e) });
         }
-    };
+    }
 
     async function resolveOkRu(url, label = "OK.ru") {
         try {
@@ -424,6 +424,76 @@
         return [];
     }
 
+    async function resolveBuzzHeavier(url, label = "BuzzHeavier") {
+        try {
+            const res = await request(url);
+            const html = res.body || "";
+            // Look for eval-packed script or direct m3u8
+            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
+            if (evalMatch) {
+                try {
+                    const unpacked = unpackJs(evalMatch[0]);
+                    const m3u8 = unpacked.match(/file:\s*["']([^"']*?m3u8[^"']*?)["']/)?.[1];
+                    if (m3u8) {
+                        return [new StreamResult({
+                            url: m3u8,
+                            quality: "Auto",
+                            source: label,
+                            headers: { "Referer": url, "User-Agent": UA }
+                        })];
+                    }
+                } catch (_) {}
+            }
+            // Fallback: look for direct m3u8 in script
+            const m3u8 = html.match(/["'](https?:\/\/[^"']*?\.m3u8[^"']*?)["']/)?.[1];
+            if (m3u8) {
+                return [new StreamResult({
+                    url: m3u8,
+                    quality: "Auto",
+                    source: label,
+                    headers: { "Referer": url, "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
+    async function resolveEfekStream(url, label, referer = "") {
+        try {
+            const res = await request(url, {
+                "User-Agent": UA,
+                "Referer": referer || manifest.baseUrl + "/"
+            });
+            const html = res.body || "";
+            // Look for m3u8 in script or eval
+            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
+            if (evalMatch) {
+                try {
+                    const unpacked = unpackJs(evalMatch[0]);
+                    const m3u8 = unpacked.match(/file:\s*["']([^"']*?m3u8[^"']*?)["']/)?.[1];
+                    if (m3u8) {
+                        return [new StreamResult({
+                            url: m3u8,
+                            quality: "Auto",
+                            source: label,
+                            headers: { "Referer": url, "User-Agent": UA }
+                        })];
+                    }
+                } catch (_) {}
+            }
+            const m3u8 = html.match(/["'](https?:\/\/[^"']*?\.m3u8[^"']*?)["']/)?.[1];
+            if (m3u8) {
+                return [new StreamResult({
+                    url: m3u8,
+                    quality: "Auto",
+                    source: label,
+                    headers: { "Referer": url, "User-Agent": UA }
+                })];
+            }
+        } catch (_) {}
+        return [];
+    }
+
     async function resolveStreamRuby(url, label = "StreamRuby") {
         try {
             const id = url.match(/embed-([a-zA-Z0-9]+)\.html/)?.[1];
@@ -434,7 +504,15 @@
                 body: `op=embed&file_code=${id}&auto=1`
             });
             const html = res.body || "";
-            const m3u8 = html.match(/file:\s*"([^"]*?m3u8[^"]*)"/)?.[1];
+            // Try to unpack packed JS first
+            let script = html;
+            const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\){[\s\S]*?}\)/);
+            if (packedMatch) {
+                try {
+                    script = unpackJs(packedMatch[0]);
+                } catch (_) {}
+            }
+            const m3u8 = script.match(/file:\s*["']([^"']*?m3u8[^"']*?)["']/)?.[1];
             if (m3u8) {
                 return [new StreamResult({
                     url: m3u8,
@@ -447,13 +525,112 @@
         return [];
     }
 
+    function unpackJs(packed) {
+        // Simple unpacker for common eval patterns
+        const paramsMatch = packed.match(/eval\(function\(p,a,c,k,e,d\)\{.*?"(.*?)",(\d+),(\d+),.*?\.split\("\|"\)/);
+        if (!paramsMatch) return packed;
+        const payload = paramsMatch[1];
+        const radix = parseInt(paramsMatch[2], 10);
+        const count = parseInt(paramsMatch[3], 10);
+        const dict = payload.split("|");
+        let result = "";
+        for (let i = 0; i < dict.length; i++) {
+            const key = i.toString(radix);
+            const val = dict[i] || key;
+            result += (val || key) + (i < dict.length - 1 ? "" : "");
+        }
+        return result;
+    }
+
+    async function resolveVidguard(url, label = "Vidguard") {
+        try {
+            const embedUrl = url.replace("/d/", "/e/").replace("/v/", "/e/");
+            const res = await request(embedUrl);
+            const html = res.body || "";
+            
+            // Find the eval script
+            const evalMatch = html.match(/<script[^>]*>([\s\S]*?eval\(function\(p,a,c,k,e,d\)[\s\S]*?\))<\/script>/);
+            if (!evalMatch) return [];
+            
+            const packed = evalMatch[1];
+            let unpacked = "";
+            
+            // Try to unpack
+            try {
+                unpacked = unpackJs(packed);
+            } catch (_) {
+                return [];
+            }
+            
+            // Parse the svg object
+            const svgMatch = unpacked.match(/svg\s*=\s*(\{[\s\S]*?\});/);
+            if (!svgMatch) return [];
+            
+            const svgObj = JSON.parse(svgMatch[1]);
+            if (!svgObj.stream) return [];
+            
+            // Decode the stream URL
+            const decodedUrl = decodeVidguardStream(svgObj.stream);
+            
+            return [new StreamResult({
+                url: decodedUrl,
+                quality: "Auto",
+                source: label,
+                headers: { "Referer": embedUrl, "User-Agent": UA }
+            })];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function decodeVidguardStream(encodedUrl) {
+        try {
+            // Extract sig parameter
+            const sigMatch = encodedUrl.match(/[?&]sig=([^&]+)/);
+            if (!sigMatch) return encodedUrl;
+            
+            const sig = sigMatch[1];
+            
+            // Decode: chunk by 2, XOR with 2, convert to chars
+            let decoded = "";
+            for (let i = 0; i < sig.length; i += 2) {
+                const hex = sig.substring(i, i + 2);
+                const charCode = parseInt(hex, 16) ^ 2;
+                decoded += String.fromCharCode(charCode);
+            }
+            
+            // Base64 decode
+            decoded = atob(decoded);
+            
+            // Remove padding if needed
+            decoded = decoded.replace(/=+$/, "");
+            
+            // Reverse and swap pairs
+            let chars = decoded.split("");
+            for (let i = 0; i < chars.length - 1; i += 2) {
+                const temp = chars[i];
+                chars[i] = chars[i + 1];
+                chars[i + 1] = temp;
+            }
+            decoded = chars.join("");
+            
+            // Remove last 5 chars
+            decoded = decoded.slice(0, -5);
+            
+            // Replace sig in URL with decoded value
+            return encodedUrl.replace(sig, decoded);
+        } catch (_) {
+            return encodedUrl;
+        }
+    }
+
     async function resolvePlayerLink(playerLink, label, referer = "") {
         let link = playerLink || "";
         if (!link || link.includes("about:blank")) return [];
 
         if (!link.startsWith("http") && !link.startsWith("//") && link.length > 10) {
             try {
-                const decoded = await atob(link);
+                const decoded = atob(link);
                 if (decoded.includes("<iframe")) {
                     const m = decoded.match(/src=["'](.*?)["']/);
                     if (m) link = m[1];
@@ -473,9 +650,12 @@
             return await resolveRumble(rumbleUrl, label || "Rumble");
         }
         if (link.includes("ok.ru")) return await resolveOkRu(link, label || "OK.ru");
-        if (link.includes("dailymotion.com")) return await resolveDailymotion(link, label || "Dailymotion");
+        if (link.includes("dailymotion.com") || link.includes("geo.dailymotion.com")) return await resolveDailymotion(link, label || "Dailymotion");
         if (link.includes("ruby") || link.includes("streamruby") || link.includes("svilla") || link.includes("svanila")) {
             return await resolveStreamRuby(link, label || "StreamRuby");
+        }
+        if (link.includes("vidguard") || link.includes("bembed.net") || link.includes("listeamed.net") || link.includes("vgfplay.com")) {
+            return await resolveVidguard(link, label || "Vidguard");
         }
         if (link.includes("buzzheavier.com")) return await resolveBuzzHeavier(link, label);
         if (link.includes("efek.stream")) return await resolveEfekStream(link, label, referer);
@@ -488,33 +668,143 @@
         })];
     }
 
-    globalThis.loadStreams = async function(url, cb) {
+    function extractQuality(text) {
+        const t = String(text || "").toLowerCase();
+        if (t.includes("2160") || t.includes("4k")) return "4K";
+        if (t.includes("1080")) return "1080p";
+        if (t.includes("720")) return "720p";
+        if (t.includes("480")) return "480p";
+        if (t.includes("360")) return "360p";
+        if (t.includes("cam")) return "CAM";
+        if (t.includes("sd")) return "SD";
+        if (t.includes("hd")) return "HD";
+        return "Auto";
+    }
+
+    async function expandHlsVariants(stream) {
+        const baseUrl = String(stream?.url || "");
+        if (!/\.m3u8(\?|$)/i.test(baseUrl)) return [stream];
+        try {
+            const headers = Object.assign({}, BASE_HEADERS, stream?.headers || {});
+            const res = await request(baseUrl, headers);
+            const text = String(res?.body || "");
+            if (!/#EXT-X-STREAM-INF/i.test(text)) return [stream];
+
+            const lines = text.split(/\r?\n/);
+            const variants = [];
+            const seenVariantUrl = new Set();
+
+            for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i];
+                if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
+                const nextLine = (lines[i + 1] || "").trim();
+                if (!nextLine || nextLine.startsWith("#")) continue;
+
+                const resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+                const quality = resMatch?.[1] ? `${resMatch[1]}p` : "Auto";
+
+                const variantUrl = resolveUrl(baseUrl, nextLine);
+                if (!variantUrl || seenVariantUrl.has(variantUrl)) continue;
+                seenVariantUrl.add(variantUrl);
+
+                const baseSource = stream.source || stream.name || "HLS";
+                variants.push(new StreamResult({
+                    url: variantUrl,
+                    quality,
+                    source: `${baseSource} - ${quality}`,
+                    headers: stream.headers || { "Referer": manifest.baseUrl + "/", "User-Agent": UA }
+                }));
+            }
+
+            if (variants.length > 0) {
+                const baseSource = stream.source || stream.name || "HLS";
+                variants.unshift(new StreamResult({
+                    url: baseUrl,
+                    quality: "Auto",
+                    source: `${baseSource} - Auto`,
+                    headers: stream.headers || { "Referer": manifest.baseUrl + "/", "User-Agent": UA }
+                }));
+                return variants;
+            }
+            return [stream];
+        } catch (_) {
+            return [stream];
+        }
+    }
+
+    async function loadStreams(url, cb) {
         try {
             const doc = await loadSiteDoc(url);
             const rawStreams = [];
 
+            // Handle .mobius option elements with base64-encoded values
             const options = Array.from(doc.querySelectorAll(".mobius option, .mirror option"));
             for (const opt of options) {
                 const val = getAttr(opt, "value");
                 if (val && val.length > 5) {
                     const label = textOf(opt) || "Server";
-                    const results = await resolvePlayerLink(val, label, url);
-                    results.forEach(r => rawStreams.push(r));
+
+                    // Try to decode base64 (like Kotlin version)
+                    let decodedUrl = val;
+                    try {
+                        const decoded = atob(val);
+                        if (decoded && decoded.includes("<iframe")) {
+                            const iframeMatch = decoded.match(/src=["'](.*?)["']/);
+                            if (iframeMatch && iframeMatch[1]) {
+                                decodedUrl = iframeMatch[1];
+                            }
+                        } else if (decoded && decoded.startsWith("http")) {
+                            decodedUrl = decoded;
+                        }
+                    } catch (_) {}
+
+                    try {
+                        const results = await resolvePlayerLink(decodedUrl, label, url);
+                        rawStreams.push(...results);
+                    } catch (_) {}
                 }
             }
 
+            // Fallback: direct iframe
             if (rawStreams.length === 0) {
                 const ifr = doc.querySelector("iframe[src], .video-content iframe");
                 if (ifr) {
                     const results = await resolvePlayerLink(getAttr(ifr, "src"), "Embed", url);
-                    results.forEach(r => rawStreams.push(r));
+                    rawStreams.push(...results);
                 }
             }
 
-            cb({ success: true, data: rawStreams });
+            // Expand HLS variants
+            const expanded = [];
+            for (const s of rawStreams) {
+                try {
+                    const variants = await expandHlsVariants(s);
+                    expanded.push(...variants);
+                } catch (_) {
+                    expanded.push(s);
+                }
+            }
+
+            // Filter only m3u8/mp4 and deduplicate
+            const uniq = [];
+            const seen = new Set();
+            for (const s of expanded) {
+                if (!/\.(m3u8|mp4)(\?|$)/i.test(String(s.url || ""))) continue;
+                const key = `${s.url}|${s.quality || ""}`;
+                if (!s.url || seen.has(key)) continue;
+                seen.add(key);
+                uniq.push(s);
+            }
+
+            cb({ success: true, data: uniq });
         } catch (e) {
             cb({ success: false, message: String(e) });
         }
-    };
+    }
 
+    // Export functions
+    globalThis.getHome = getHome;
+    globalThis.search = search;
+    globalThis.load = load;
+    globalThis.loadStreams = loadStreams;
 })();
