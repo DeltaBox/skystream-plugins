@@ -136,14 +136,15 @@
 
     function extractQuality(text) {
         const t = String(text || "").toLowerCase();
-        if (t.includes("2160") || t.includes("4k")) return "4K";
-        if (t.includes("1080")) return "1080p";
-        if (t.includes("720")) return "720p";
-        if (t.includes("480")) return "480p";
-        if (t.includes("360")) return "360p";
+        if (t.includes("2160") || t.includes("4k") || t.includes("ultra")) return "4K";
+        if (t.includes("1080") || t.includes("full")) return "1080p";
+        if (t.includes("1440") || t.includes("quad")) return "1440p";
+        if (t.includes("720") || t.includes("hd")) return "720p";
+        if (t.includes("480") || t.includes("sd")) return "480p";
+        if (t.includes("360") || t.includes("low")) return "360p";
+        if (t.includes("240") || t.includes("lowest")) return "240p";
+        if (t.includes("144") || t.includes("mobile")) return "144p";
         if (t.includes("cam")) return "CAM";
-        if (t.includes("sd")) return "SD";
-        if (t.includes("hd")) return "HD";
         return "Auto";
     }
 
@@ -281,11 +282,11 @@
     async function getHome(cb) {
         try {
             const sections = [
-                { name: "🔥 Popular", path: "/anime/?order=popular" },
-                { name: "🆕 Latest Updates", path: "/anime/?order=update" },
-                { name: "📺 Ongoing", path: "/anime/?status=ongoing&order=update" },
-                { name: "✅ Completed", path: "/anime/?status=completed&order=update" },
-                { name: "🎬 Movies", path: "/anime/?type=movie&order=update" }
+                { name: "Terbaru", path: "/" },
+                { name: "Ongoing", path: "/anime/?status=ongoing&order=update" },
+                { name: "Tamat", path: "/anime/?status=completed&order=update" },
+                { name: "Movie", path: "/anime/?type=movie&order=update" },
+                { name: "Populer", path: "/anime/?order=popular" }
             ];
 
             const data = {};
@@ -298,12 +299,6 @@
                 } catch (e) {
                     // Skip failed sections
                 }
-            }
-
-            // Fallback to homepage if all sections fail
-            if (Object.keys(data).length === 0) {
-                const items = await fetchSection("/", 1, 1);
-                if (items && items.length > 0) data["🏠 Terbaru"] = items.slice(0, 20);
             }
 
             cb({ success: true, data });
@@ -319,9 +314,17 @@
             const url = `${manifest.baseUrl}/?s=${encoded}`;
 
             const doc = await loadDoc(url);
-            const items = Array.from(doc.querySelectorAll("div.listupd article"))
+            let items = Array.from(doc.querySelectorAll("div.listupd article, div.bsx"))
                 .map(parseItemFromElement)
                 .filter(Boolean);
+
+            if (items.length === 0) {
+                // Try alternative search if standard fails
+                const altDoc = await loadDoc(`${manifest.baseUrl}/page/1/?s=${encoded}`);
+                items = Array.from(altDoc.querySelectorAll("div.listupd article, div.bsx"))
+                    .map(parseItemFromElement)
+                    .filter(Boolean);
+            }
 
             const out = items.filter(it => scoreResult(it, normalizedQuery) > 0);
             out.sort((a, b) => scoreResult(b, normalizedQuery) - scoreResult(a, normalizedQuery));
@@ -416,15 +419,23 @@
         try {
             const res = await request(url);
             const html = res.body || "";
-            const m3u8Match = html.match(/"url":"(https?:\/\/.*?\.m3u8)"/);
-            if (m3u8Match) {
-                return [new StreamResult({
-                    url: m3u8Match[1].replace(/\\\//g, "/"),
+            const matches = html.match(/"url":"(https?:\/\/.*?\.m3u8)"/g) || html.match(/"(https?:\/\/.*?\.m3u8)"/g);
+            if (!matches) return [];
+
+            const results = [];
+            const seen = new Set();
+            for (const m of matches) {
+                const u = m.replace(/"/g, "").replace(/url:/g, "").replace(/\\\//g, "/");
+                if (seen.has(u) || !u.includes("m3u8")) continue;
+                seen.add(u);
+                results.push(new StreamResult({
+                    url: u,
                     quality: "Auto",
                     source: label,
                     headers: { "User-Agent": UA }
-                })];
+                }));
             }
+            return results;
         } catch (_) {}
         return [];
     }
@@ -433,7 +444,7 @@
         try {
             const res = await request(url);
             const html = res.body || "";
-            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
+            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/);
             if (evalMatch) {
                 try {
                     const unpacked = unpackJs(evalMatch[0]);
@@ -468,7 +479,7 @@
                 "Referer": referer || manifest.baseUrl + "/"
             });
             const html = res.body || "";
-            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\)/);
+            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/);
             if (evalMatch) {
                 try {
                     const unpacked = unpackJs(evalMatch[0]);
@@ -507,13 +518,13 @@
             });
             const html = res.body || "";
             let script = html;
-            const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\){[\s\S]*?}\)/);
+            const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/);
             if (packedMatch) {
                 try {
                     script = unpackJs(packedMatch[0]);
                 } catch (_) {}
             }
-            const m3u8 = script.match(/file:\s*["']([^"']*?m3u8[^"']*?)["']/)?.[1];
+            const m3u8 = script.match(/file:\s*["']([^"']*?m3u8[^"']*?)["']/)?.[1] || script.match(/["'](https?:\/\/[^"']*?\.m3u8[^"']*?)["']/)?.[1];
             if (m3u8) {
                 return [new StreamResult({
                     url: m3u8,
@@ -531,9 +542,9 @@
             const embedUrl = url.replace("/d/", "/e/").replace("/v/", "/e/");
             const res = await request(embedUrl);
             const html = res.body || "";
-            const evalMatch = html.match(/<script[^>]*>([\s\S]*?eval\(function\(p,a,c,k,e,d\)[\s\S]*?\))<\/script>/);
+            const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/);
             if (!evalMatch) return [];
-            const packed = evalMatch[1];
+            const packed = evalMatch[0];
             let unpacked = "";
             try {
                 unpacked = unpackJs(packed);
@@ -557,18 +568,30 @@
     }
 
     function unpackJs(packed) {
-        const paramsMatch = packed.match(/eval\(function\(p,a,c,k,e,d\)\{.*?"(.*?)",(\d+),(\d+),.*?\.split\("\|"\)/);
-        if (!paramsMatch) return packed;
-        const payload = paramsMatch[1];
-        const radix = parseInt(paramsMatch[2], 10);
-        const dict = payload.split("|");
-        let result = "";
-        for (let i = 0; i < dict.length; i++) {
-            const key = i.toString(radix);
-            const val = dict[i] || key;
-            result += (val || key);
+        try {
+            const match = packed.match(/}\s*\(\s*(['"].+?['"])\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"].+?['"])\.split\(['"]\|['"]\)/);
+            if (!match) return packed;
+
+            let p = match[1];
+            let a = parseInt(match[2], 10);
+            let c = parseInt(match[3], 10);
+            let k = match[4].slice(1, -1).split("|");
+
+            if (p.startsWith("'") || p.startsWith('"')) p = p.slice(1, -1);
+
+            const e = (c) => {
+                return (c < a ? "" : e(parseInt(c / a, 10))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+            };
+
+            const dict = {};
+            while (c--) {
+                dict[e(c)] = k[c] || e(c);
+            }
+
+            return p.replace(/\b\w+\b/g, (w) => dict[w] || w);
+        } catch (_) {
+            return packed;
         }
-        return result;
     }
 
     function decodeVidguardStream(encodedUrl) {
@@ -576,19 +599,24 @@
             const sigMatch = encodedUrl.match(/[?&]sig=([^&]+)/);
             if (!sigMatch) return encodedUrl;
             const sig = sigMatch[1];
-            let decoded = "";
+
+            let base64String = "";
             for (let i = 0; i < sig.length; i += 2) {
                 const hex = sig.substring(i, i + 2);
-                const charCode = parseInt(hex, 16) ^ 2;
-                decoded += String.fromCharCode(charCode);
+                base64String += String.fromCharCode(parseInt(hex, 16) ^ 2);
             }
-            decoded = atob(decoded);
-            decoded = decoded.replace(/=+$/, "");
+
+            let decoded = atob(base64String);
+            decoded = decoded.slice(0, -5);
+            decoded = decoded.split("").reverse().join("");
+
             let chars = decoded.split("");
             for (let i = 0; i < chars.length - 1; i += 2) {
-                const temp = chars[i];
-                chars[i] = chars[i + 1];
-                chars[i + 1] = temp;
+                if (i + 1 < chars.length) {
+                    const temp = chars[i];
+                    chars[i] = chars[i + 1];
+                    chars[i + 1] = temp;
+                }
             }
             decoded = chars.join("");
             decoded = decoded.slice(0, -5);
