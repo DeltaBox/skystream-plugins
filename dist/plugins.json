@@ -1,5 +1,23 @@
 [
   {
+    "packageName": "kai.delta.anichin",
+    "name": "Anichin 🐉",
+    "version": 1,
+    "baseUrl": "https://anichin.cafe",
+    "description": "Nonton donghua subtitle Indonesia gratis",
+    "authors": [
+      "kai"
+    ],
+    "languages": [
+      "id"
+    ],
+    "categories": [
+      "Anime",
+      "Donghua"
+    ],
+    "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.anichin.sky"
+  },
+  {
     "packageName": "kai.delta.lk21",
     "name": "LK21",
     "version": 3,
