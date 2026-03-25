@@ -1,0 +1,10 @@
+{
+    "id": "kai.delta.missav",
+    "name": "MissAV",
+    "version": "1.0.0",
+    "baseUrl": "https://missav.ws",
+    "language": "ja",
+    "description": "Ported MissAV plugin from CloudStream (GizliKeyif).",
+    "iconUrl": "https://missav.ws/favicon.ico",
+    "types": ["nsfw"]
+}
