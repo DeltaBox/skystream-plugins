@@ -35,5 +35,18 @@
       "TvSeries"
     ],
     "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.lk21.sky"
+  },
+  {
+    "id": "kai.delta.missav",
+    "name": "MissAV",
+    "version": "1.0.0",
+    "baseUrl": "https://missav.ws",
+    "language": "ja",
+    "description": "Ported MissAV plugin from CloudStream (GizliKeyif).",
+    "iconUrl": "https://missav.ws/favicon.ico",
+    "types": [
+      "nsfw"
+    ],
+    "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.missav.sky"
   }
 ]
