@@ -292,14 +292,25 @@
         try {
             const res = await request(url);
             const html = res.body || "";
+            const finalUrl = String(res?.finalUrl || res?.url || url || "");
+            
+            if (isCloudflareBlocked(res, finalUrl)) {
+                throw new Error(`CLOUDFLARE_BLOCKED: ${finalUrl}`);
+            }
+
             const streams = [];
 
-            const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/);
-            if (packedMatch) {
-                const unpacked = unpackJs(packedMatch[0]);
-                const m3u8Match = unpacked.match(/source=['"](.*?)['"]/);
-                if (m3u8Match) {
-                    const m3u8Url = m3u8Match[1];
+            // MissAV usually has the m3u8 inside a packed script.
+            // Some pages might have multiple eval blocks.
+            const packedRegex = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/g;
+            let match;
+            while ((match = packedRegex.exec(html)) !== null) {
+                const unpacked = unpackJs(match[0]);
+                // Check for m3u8 in the unpacked script
+                const m3u8Regex = /['"](https?:\/\/[^'"]+?\.m3u8[^'"]*?)['"]/g;
+                let mMatch;
+                while ((mMatch = m3u8Regex.exec(unpacked)) !== null) {
+                    const m3u8Url = mMatch[1].replace(/\\/g, "");
                     streams.push(new StreamResult({
                         url: m3u8Url,
                         quality: "Auto",
@@ -307,17 +318,22 @@
                         headers: { "Referer": "https://missav.com", "User-Agent": UA }
                     }));
                 }
-            } else {
-                // Fallback attempt to find m3u8 in plain script
-                const m3u8Regex = /["'](https?:\/\/[^"']*?\.m3u8[^"']*?)["']/gi;
-                let match;
-                while ((match = m3u8Regex.exec(html)) !== null) {
-                    streams.push(new StreamResult({
-                        url: match[1],
-                        quality: "Auto",
-                        source: "MissAV Fallback",
-                        headers: { "Referer": "https://missav.com", "User-Agent": UA }
-                    }));
+            }
+
+            // Fallback: look for m3u8 in the whole HTML if no packed script worked
+            if (streams.length === 0) {
+                const m3u8Regex = /['"](https?:\/\/[^'"]+?\.m3u8[^'"]*?)['"]/gi;
+                let fallbackMatch;
+                while ((fallbackMatch = m3u8Regex.exec(html)) !== null) {
+                    const u = fallbackMatch[1].replace(/\\/g, "");
+                    if (u.includes(".m3u8")) {
+                        streams.push(new StreamResult({
+                            url: u,
+                            quality: "Auto",
+                            source: "MissAV Fallback",
+                            headers: { "Referer": "https://missav.com", "User-Agent": UA }
+                        }));
+                    }
                 }
             }
 
