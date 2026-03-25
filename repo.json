@@ -1,9 +1,0 @@
-{
-  "name": "Kai Delta Sky Repository",
-  "packageName": "kai.delta",
-  "description": "SkyStream plugins repository",
-  "manifestVersion": 1,
-  "pluginLists": [
-    "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/plugins.json"
-  ]
-}
