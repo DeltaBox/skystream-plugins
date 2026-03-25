@@ -288,6 +288,58 @@
         }
     }
 
+    async function expandHlsVariants(stream) {
+        const baseUrl = String(stream?.url || "");
+        if (!baseUrl.includes(".m3u8")) return [stream];
+
+        try {
+            const headers = Object.assign({}, BASE_HEADERS, stream?.headers || {});
+            const res = await request(baseUrl, headers);
+            const text = String(res?.body || "");
+            if (!/#EXT-X-STREAM-INF/i.test(text)) return [stream];
+
+            const lines = text.split(/\r?\n/);
+            const variants = [];
+            const seenVariantUrl = new Set();
+
+            for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i];
+                if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
+                const nextLine = (lines[i + 1] || "").trim();
+                if (!nextLine || nextLine.startsWith("#")) continue;
+
+                const resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+                const quality = resMatch?.[1] ? `${resMatch[1]}p` : "Auto";
+
+                const variantUrl = resolveUrl(baseUrl, nextLine);
+                if (!variantUrl || seenVariantUrl.has(variantUrl)) continue;
+                seenVariantUrl.add(variantUrl);
+
+                const baseSource = stream.source || stream.name || "HLS";
+                variants.push(new StreamResult({
+                    url: variantUrl,
+                    quality,
+                    source: `${baseSource} - ${quality}`,
+                    headers: stream.headers || { "Referer": baseUrl, "User-Agent": UA }
+                }));
+            }
+
+            if (variants.length > 0) {
+                const baseSource = stream.source || stream.name || "HLS";
+                variants.unshift(new StreamResult({
+                    url: baseUrl,
+                    quality: "Auto",
+                    source: `${baseSource} - Auto`,
+                    headers: stream.headers || { "Referer": baseUrl, "User-Agent": UA }
+                }));
+                return variants;
+            }
+            return [stream];
+        } catch (_) {
+            return [stream];
+        }
+    }
+
     async function loadStreams(url, cb) {
         try {
             const res = await request(url);
@@ -298,7 +350,7 @@
                 throw new Error(`CLOUDFLARE_BLOCKED: ${finalUrl}`);
             }
 
-            const streams = [];
+            const rawStreams = [];
 
             // MissAV usually has the m3u8 inside a packed script.
             // Some pages might have multiple eval blocks.
@@ -311,7 +363,7 @@
                 let mMatch;
                 while ((mMatch = m3u8Regex.exec(unpacked)) !== null) {
                     const m3u8Url = mMatch[1].replace(/\\/g, "");
-                    streams.push(new StreamResult({
+                    rawStreams.push(new StreamResult({
                         url: m3u8Url,
                         quality: "Auto",
                         source: "MissAV",
@@ -321,13 +373,13 @@
             }
 
             // Fallback: look for m3u8 in the whole HTML if no packed script worked
-            if (streams.length === 0) {
+            if (rawStreams.length === 0) {
                 const m3u8Regex = /['"](https?:\/\/[^'"]+?\.m3u8[^'"]*?)['"]/gi;
                 let fallbackMatch;
                 while ((fallbackMatch = m3u8Regex.exec(html)) !== null) {
                     const u = fallbackMatch[1].replace(/\\/g, "");
                     if (u.includes(".m3u8")) {
-                        streams.push(new StreamResult({
+                        rawStreams.push(new StreamResult({
                             url: u,
                             quality: "Auto",
                             source: "MissAV Fallback",
@@ -337,7 +389,27 @@
                 }
             }
 
-            cb({ success: true, data: uniqueByUrl(streams) });
+            const expanded = [];
+            for (const s of rawStreams) {
+                try {
+                    const variants = await expandHlsVariants(s);
+                    expanded.push(...variants);
+                } catch (_) {
+                    expanded.push(s);
+                }
+            }
+
+            const uniq = [];
+            const finalSeen = new Set();
+            for (const s of expanded) {
+                if (!s.url) continue;
+                const key = `${s.url}|${s.quality || ""}`;
+                if (finalSeen.has(key)) continue;
+                finalSeen.add(key);
+                uniq.push(s);
+            }
+
+            cb({ success: true, data: uniq });
         } catch (e) {
             cb({ success: false, errorCode: "STREAM_ERROR", message: String(e?.message || e) });
         }
