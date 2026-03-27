@@ -19,7 +19,7 @@
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
-        "Referer": `https://missav.ws/`
+        "Referer": `${manifest.baseUrl}/`
     };
 
     const EXCLUDE_PATHS = [
@@ -132,6 +132,60 @@
         } catch (_) {
             return packed;
         }
+    }
+
+    function decodeEscapedUrl(raw) {
+        let out = String(raw || "").trim();
+        if (!out) return "";
+
+        out = out
+            .replace(/\\u002F/gi, "/")
+            .replace(/\\u003A/gi, ":")
+            .replace(/\\\//g, "/")
+            .replace(/\\x2f/gi, "/")
+            .replace(/\\x3a/gi, ":")
+            .replace(/&amp;/gi, "&");
+
+        return out;
+    }
+
+    function cleanupStreamUrl(rawUrl, pageUrl) {
+        const decoded = decodeEscapedUrl(rawUrl)
+            .replace(/["'`]/g, "")
+            .trim();
+
+        if (!decoded || !/\.m3u8(\?|$)/i.test(decoded)) return "";
+
+        if (decoded.startsWith("//")) return `https:${decoded}`;
+        if (/^https?:\/\//i.test(decoded)) return decoded;
+
+        try {
+            return new URL(decoded, String(pageUrl || manifest.baseUrl)).toString();
+        } catch (_) {
+            return normalizeUrl(decoded, manifest.baseUrl);
+        }
+    }
+
+    function collectM3u8Candidates(text) {
+        const body = decodeEscapedUrl(text || "");
+        if (!body) return [];
+
+        const candidates = new Set();
+        const patterns = [
+            /(?:file|src|source|hls|playlist|video_url|play_url)\s*[:=]\s*["']([^"'\n\r]+?\.m3u8[^"'\n\r]*)["']/gi,
+            /["']((?:https?:)?\/\/[^"'\s]+?\.m3u8[^"'\s]*)["']/gi,
+            /["']((?:\/?[^"'\s]+?\.m3u8[^"'\s]*))["']/gi
+        ];
+
+        for (const rx of patterns) {
+            let m;
+            while ((m = rx.exec(body)) !== null) {
+                const u = String(m[1] || "").trim();
+                if (u && /\.m3u8(\?|$)/i.test(u)) candidates.add(u);
+            }
+        }
+
+        return Array.from(candidates);
     }
 
     // --- Network ---
@@ -290,10 +344,11 @@
 
     async function expandHlsVariants(stream) {
         const baseUrl = String(stream?.url || "");
-        if (!baseUrl.includes(".m3u8")) return [stream];
+        if (!/\.m3u8(\?|$)/i.test(baseUrl)) return [stream];
 
         try {
-            const headers = Object.assign({}, BASE_HEADERS, stream?.headers || {});
+            const referer = stream?.headers?.Referer || `${manifest.baseUrl}/`;
+            const headers = Object.assign({}, BASE_HEADERS, stream?.headers || {}, { Referer: referer });
             const res = await request(baseUrl, headers);
             const text = String(res?.body || "");
             if (!/#EXT-X-STREAM-INF/i.test(text)) return [stream];
@@ -320,7 +375,7 @@
                     url: variantUrl,
                     quality,
                     source: `${baseSource} - ${quality}`,
-                    headers: stream.headers || { "Referer": baseUrl, "User-Agent": UA }
+                    headers: Object.assign({}, stream?.headers || {}, { Referer: referer, "User-Agent": UA })
                 }));
             }
 
@@ -330,7 +385,7 @@
                     url: baseUrl,
                     quality: "Auto",
                     source: `${baseSource} - Auto`,
-                    headers: stream.headers || { "Referer": baseUrl, "User-Agent": UA }
+                    headers: Object.assign({}, stream?.headers || {}, { Referer: referer, "User-Agent": UA })
                 }));
                 return variants;
             }
@@ -342,7 +397,7 @@
 
     async function loadStreams(url, cb) {
         try {
-            const res = await request(url);
+            const res = await request(url, { Referer: `${manifest.baseUrl}/` });
             const html = res.body || "";
             const finalUrl = String(res?.finalUrl || res?.url || url || "");
             
@@ -351,41 +406,37 @@
             }
 
             const rawStreams = [];
+            const seenRaw = new Set();
+            const referer = finalUrl || url || `${manifest.baseUrl}/`;
+
+            function addStreamCandidate(candidateUrl, source) {
+                const cleaned = cleanupStreamUrl(candidateUrl, referer);
+                if (!cleaned || seenRaw.has(cleaned)) return;
+                seenRaw.add(cleaned);
+
+                rawStreams.push(new StreamResult({
+                    url: cleaned,
+                    quality: "Auto",
+                    source,
+                    headers: { "Referer": referer, "User-Agent": UA }
+                }));
+            }
 
             // MissAV usually has the m3u8 inside a packed script.
             // Some pages might have multiple eval blocks.
             const packedRegex = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/g;
-            let match;
-            while ((match = packedRegex.exec(html)) !== null) {
-                const unpacked = unpackJs(match[0]);
-                // Check for m3u8 in the unpacked script
-                const m3u8Regex = /['"](https?:\/\/[^'"]+?\.m3u8[^'"]*?)['"]/g;
-                let mMatch;
-                while ((mMatch = m3u8Regex.exec(unpacked)) !== null) {
-                    const m3u8Url = mMatch[1].replace(/\\/g, "");
-                    rawStreams.push(new StreamResult({
-                        url: m3u8Url,
-                        quality: "Auto",
-                        source: "MissAV",
-                        headers: { "Referer": "https://missav.com", "User-Agent": UA }
-                    }));
+            let packedMatch;
+            while ((packedMatch = packedRegex.exec(html)) !== null) {
+                const unpacked = unpackJs(packedMatch[0]);
+                for (const u of collectM3u8Candidates(unpacked)) {
+                    addStreamCandidate(u, "MissAV Packed");
                 }
             }
 
-            // Fallback: look for m3u8 in the whole HTML if no packed script worked
+            // Fallback: look for m3u8 in full page HTML
             if (rawStreams.length === 0) {
-                const m3u8Regex = /['"](https?:\/\/[^'"]+?\.m3u8[^'"]*?)['"]/gi;
-                let fallbackMatch;
-                while ((fallbackMatch = m3u8Regex.exec(html)) !== null) {
-                    const u = fallbackMatch[1].replace(/\\/g, "");
-                    if (u.includes(".m3u8")) {
-                        rawStreams.push(new StreamResult({
-                            url: u,
-                            quality: "Auto",
-                            source: "MissAV Fallback",
-                            headers: { "Referer": "https://missav.com", "User-Agent": UA }
-                        }));
-                    }
+                for (const u of collectM3u8Candidates(html)) {
+                    addStreamCandidate(u, "MissAV Fallback");
                 }
             }
 
