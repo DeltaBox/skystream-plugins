@@ -1,8 +1,9 @@
 {
   "packageName": "kai.delta.missav",
   "name": "MissAV",
-  "version": 3,
+  "version": 5,
   "baseUrl": "https://missav.ws",
+  "apiBaseUrl": "https://missab-seven.vercel.app",
   "description": "Ported MissAV plugin from CloudStream (GizliKeyif).",
   "authors": [
     "kai"
