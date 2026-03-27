@@ -188,6 +188,23 @@
         return Array.from(candidates);
     }
 
+    function candidatePriority(url) {
+        const u = String(url || "").toLowerCase();
+        if (u.includes("/1080p/") || u.includes("source1280")) return 100;
+        if (u.includes("/720p/") || u.includes("source842")) return 90;
+        if (u.includes("master.m3u8")) return 80;
+        if (u.includes("playlist.m3u8")) return 70;
+        return 10;
+    }
+
+    function qualityPriority(value) {
+        const q = String(value || "").toLowerCase();
+        if (q === "auto") return 0;
+        const m = q.match(/(\d{3,4})p/);
+        if (m) return parseInt(m[1], 10);
+        return 1;
+    }
+
     // --- Network ---
     async function request(url, headers = {}) {
         return http_get(url, { headers: Object.assign({}, BASE_HEADERS, headers) });
@@ -380,8 +397,11 @@
             }
 
             if (variants.length > 0) {
+                // Prefer highest resolution first.
+                variants.sort((a, b) => qualityPriority(b.quality) - qualityPriority(a.quality));
+
                 const baseSource = stream.source || stream.name || "HLS";
-                variants.unshift(new StreamResult({
+                variants.push(new StreamResult({
                     url: baseUrl,
                     quality: "Auto",
                     source: `${baseSource} - Auto`,
@@ -441,6 +461,7 @@
             }
 
             const expanded = [];
+            rawStreams.sort((a, b) => candidatePriority(b.url) - candidatePriority(a.url));
             for (const s of rawStreams) {
                 try {
                     const variants = await expandHlsVariants(s);
@@ -459,6 +480,12 @@
                 finalSeen.add(key);
                 uniq.push(s);
             }
+
+            uniq.sort((a, b) => {
+                const qp = qualityPriority(b.quality) - qualityPriority(a.quality);
+                if (qp !== 0) return qp;
+                return candidatePriority(b.url) - candidatePriority(a.url);
+            });
 
             cb({ success: true, data: uniq });
         } catch (e) {
