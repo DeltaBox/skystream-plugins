@@ -5,11 +5,21 @@
     // manifest is injected at runtime
 
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+    const LOCALE_FALLBACKS = ["en", "id"];
 
     const BASE_HEADERS = {
         "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
         "Referer": `${manifest.baseUrl}/`
     };
 
@@ -62,6 +72,47 @@
         q = q.replace(/\+/g, " ");
         q = q.replace(/^["']|["']$/g, "");
         return q.trim();
+    }
+
+    function extractDm(pathOrUrl) {
+        const text = String(pathOrUrl || "");
+        const m = text.match(/\/(dm\d+)\//i);
+        return m ? m[1].toLowerCase() : "";
+    }
+
+    function extractLocale(pathOrUrl) {
+        const text = String(pathOrUrl || "");
+        const m = text.match(/\/(en|id|ja|ko|zh|cn|ms|th|de|fr|vi|fil|pt)\//i);
+        return m ? m[1].toLowerCase() : "";
+    }
+
+    function stripLeadingLocale(path) {
+        return String(path || "").replace(/^\/(?:en|id|ja|ko|zh|cn|ms|th|de|fr|vi|fil|pt)(?=\/|$)/i, "") || "/";
+    }
+
+    function toSourceUrl(path, locale = "en", dm = "") {
+        const base = String(manifest.baseUrl || "").replace(/\/+$/, "");
+        const raw = String(path || "").trim();
+        if (!raw) return `${base}/${dm ? `${dm}/` : ""}${locale}`;
+        if (/^https?:\/\//i.test(raw)) return raw;
+        if (/^\/dm\d+\//i.test(raw)) return `${base}${raw}`;
+        if (raw === "/") return `${base}/${dm ? `${dm}/` : ""}${locale}`;
+        const suffix = stripLeadingLocale(raw);
+        return `${base}/${dm ? `${dm}/` : ""}${locale}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+    }
+
+    function toSourceUrlFromInput(input) {
+        const raw = String(input || "").trim();
+        if (!raw) return toSourceUrl("/", "en", "");
+        if (!/^https?:\/\//i.test(raw)) return toSourceUrl(raw.startsWith("/") ? raw : `/${raw}`, "en", "");
+
+        try {
+            const u = new URL(raw);
+            const segs = u.pathname.split("/").filter(Boolean);
+            if (segs[0] && /^dm\d+$/i.test(segs[0])) return u.toString();
+            return u.toString();
+        } catch (_) {}
+        return raw;
     }
 
     function parseYear(text) {
@@ -248,7 +299,7 @@
 
         return new MultimediaItem({
             title,
-            url: href,
+            url: `${String(manifest.baseUrl || "").replace(/\/+$/, "")}/en/${id}`,
             posterUrl,
             description,
             type: "movie",
@@ -275,13 +326,17 @@
         return uniqueByUrl(items);
     }
 
-    async function fetchListByPaths(paths) {
+    async function fetchListByPaths(paths, locales = LOCALE_FALLBACKS, dmCandidates = [""]) {
         for (const path of paths) {
             try {
-                const url = path.startsWith("http") ? path : `${manifest.baseUrl}${path}`;
-                const doc = await loadDoc(url);
-                const items = collectItems(doc);
-                if (items.length > 0) return items;
+                for (const dm of dmCandidates) {
+                    for (const locale of locales) {
+                        const url = toSourceUrl(path, locale, dm);
+                        const doc = await loadDoc(url);
+                        const items = collectItems(doc);
+                        if (items.length > 0) return items;
+                    }
+                }
             } catch (_) {}
         }
         return [];
@@ -395,11 +450,12 @@
 
     async function getHome(cb) {
         try {
+            const dmCandidates = ["", "dm32", "dm263", "dm628", "dm515", "dm291"];
             const [recommended, latest, trending, uncensored] = await Promise.all([
-                fetchListByPaths(["/", "/en", "/new?page=1"]),
-                fetchListByPaths(["/new?page=1", "/en/new?page=1"]),
-                fetchListByPaths(["/today-hot?page=1", "/dm263/en/today-hot?sort=views"]),
-                fetchListByPaths(["/uncensored?page=1", "/genres/Uncensored?page=1", "/tags/uncensored?page=1", "/search/uncensored?page=1"])
+                fetchListByPaths(["/en", "/"], LOCALE_FALLBACKS, dmCandidates),
+                fetchListByPaths(["/en/new?page=1", "/new?page=1"], LOCALE_FALLBACKS, dmCandidates),
+                fetchListByPaths(["/en/today-hot?page=1", "/today-hot?page=1"], LOCALE_FALLBACKS, dmCandidates),
+                fetchListByPaths(["/uncensored-leak?sort=monthly_views", "/search/uncensored?page=1"], LOCALE_FALLBACKS, dmCandidates)
             ]);
 
             const data = {};
@@ -427,8 +483,18 @@
         try {
             const normalized = normalizeSearchQuery(query);
             const encoded = encodeURIComponent(normalized);
-            const doc = await loadDoc(`${manifest.baseUrl}/search/${encoded}?page=1`);
-            const items = collectItems(doc);
+            let items = [];
+            const candidates = ["", "dm32", "dm263"];
+            for (const dm of candidates) {
+                for (const locale of LOCALE_FALLBACKS) {
+                    try {
+                        const doc = await loadDoc(toSourceUrl(`/search/${encoded}?page=1`, locale, dm));
+                        items = collectItems(doc);
+                        if (items.length > 0) break;
+                    } catch (_) {}
+                }
+                if (items.length > 0) break;
+            }
             cb({ success: true, data: items });
         } catch (e) {
             cb({ success: false, errorCode: "SEARCH_ERROR", message: String(e?.message || e) });
@@ -437,9 +503,7 @@
 
     async function load(url, cb) {
         try {
-            const target = /^https?:\/\//i.test(String(url || ""))
-                ? String(url)
-                : `${manifest.baseUrl.replace(/\/+$/, "")}/${String(url || "").replace(/^\/+/, "")}`;
+            const target = toSourceUrlFromInput(url);
 
             const doc = await loadDoc(target);
             const title = textOf(doc.querySelector("h1.text-base")) || textOf(doc.querySelector("h1"));
@@ -497,9 +561,7 @@
 
     async function loadStreams(url, cb) {
         try {
-            const target = /^https?:\/\//i.test(String(url || ""))
-                ? String(url)
-                : `${manifest.baseUrl.replace(/\/+$/, "")}/${String(url || "").replace(/^\/+/, "")}`;
+            const target = toSourceUrlFromInput(url);
 
             const res = await request(target, { Referer: `${manifest.baseUrl}/` });
             const html = String(res?.body || "");
