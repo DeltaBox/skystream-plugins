@@ -39,7 +39,7 @@
   {
     "packageName": "kai.delta.missav",
     "name": "MissAV",
-    "version": 2,
+    "version": 3,
     "baseUrl": "https://missav.ws",
     "description": "Ported MissAV plugin from CloudStream (GizliKeyif).",
     "authors": [
