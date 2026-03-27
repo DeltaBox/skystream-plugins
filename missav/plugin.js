@@ -5,7 +5,56 @@
     // manifest is injected at runtime
 
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
-    const API_BASE = String(manifest.apiBaseUrl || "https://missab-seven.vercel.app").replace(/\/+$/, "");
+
+    const BASE_HEADERS = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": `${manifest.baseUrl}/`
+    };
+
+    function normalizeUrl(url, base) {
+        if (!url) return "";
+        const raw = String(url).trim();
+        if (!raw) return "";
+        if (raw.startsWith("//")) return `https:${raw}`;
+        if (/^https?:\/\//i.test(raw)) return raw;
+        if (raw.startsWith("/")) return `${base}${raw}`;
+        return `${base}/${raw}`;
+    }
+
+    function resolveUrl(base, next) {
+        try {
+            return new URL(String(next || ""), String(base || manifest.baseUrl)).toString();
+        } catch (_) {
+            return normalizeUrl(next, manifest.baseUrl);
+        }
+    }
+
+    function htmlDecode(text) {
+        if (!text) return "";
+        return String(text)
+            .replace(/&amp;/g, "&")
+            .replace(/&quot;/g, '"')
+            .replace(/&#039;/g, "'")
+            .replace(/&apos;/g, "'")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+    }
+
+    function textOf(el) {
+        return htmlDecode((el?.textContent || "").replace(/\s+/g, " ").trim());
+    }
+
+    function getAttr(el, ...attrs) {
+        if (!el) return "";
+        for (const attr of attrs) {
+            const v = el.getAttribute(attr);
+            if (v && String(v).trim()) return String(v).trim();
+        }
+        return "";
+    }
 
     function normalizeSearchQuery(query) {
         let q = String(query || "").trim();
@@ -15,17 +64,18 @@
         return q.trim();
     }
 
+    function parseYear(text) {
+        const m = String(text || "").match(/\b(19\d{2}|20\d{2})\b/);
+        return m ? parseInt(m[1], 10) : null;
+    }
+
     function extractVideoId(input) {
         const raw = String(input || "").trim();
         if (!raw) return "";
-
-        if (!/^https?:\/\//i.test(raw)) {
-            return raw.replace(/^\/+|\/+$/g, "");
-        }
+        if (!/^https?:\/\//i.test(raw)) return raw.replace(/^\/+|\/+$/g, "");
 
         const noHash = raw.split("#")[0];
         const [basePart, queryPart = ""] = noHash.split("?");
-
         if (queryPart) {
             const parts = queryPart.split("&");
             for (const part of parts) {
@@ -39,30 +89,6 @@
         const path = basePart.replace(/^https?:\/\/[^/]+/i, "");
         const segs = path.split("/").filter(Boolean);
         return segs.length ? segs[segs.length - 1] : "";
-    }
-
-    function parseYear(text) {
-        const m = String(text || "").match(/\b(19\d{2}|20\d{2})\b/);
-        return m ? parseInt(m[1], 10) : null;
-    }
-
-    function qualityPriority(value) {
-        const q = String(value || "").toLowerCase();
-        if (q === "auto") return 0;
-        if (q === "4k" || q === "uhd" || q === "2160p") return 2160;
-        const m = q.match(/(\d{3,4})p/);
-        return m ? parseInt(m[1], 10) : 1;
-    }
-
-    function streamQualityFromUrl(url) {
-        const u = String(url || "").toLowerCase();
-        if (u.includes("/2160p/") || u.includes("/4k/")) return "2160p";
-        if (u.includes("/1440p/")) return "1440p";
-        if (u.includes("/1080p/") || u.includes("source1280")) return "1080p";
-        if (u.includes("/720p/") || u.includes("source842")) return "720p";
-        if (u.includes("/480p/")) return "480p";
-        if (u.includes("/360p/")) return "360p";
-        return "Auto";
     }
 
     function decodeEscapedUrl(raw) {
@@ -90,6 +116,69 @@
         }
     }
 
+    function unpackJs(packed) {
+        try {
+            const match = packed.match(/}\s*\(\s*(['"].+?['"])\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"].+?['"])\.split\(['"]\|['"]\)/);
+            if (!match) return packed;
+
+            let p = match[1];
+            const a = parseInt(match[2], 10);
+            let c = parseInt(match[3], 10);
+            const k = match[4].slice(1, -1).split("|");
+
+            if (p.startsWith("'") || p.startsWith("\"")) p = p.slice(1, -1);
+
+            const e = (n) => (n < a ? "" : e(parseInt(n / a, 10))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+            const dict = {};
+            while (c--) dict[e(c)] = k[c] || e(c);
+
+            return p.replace(/\b\w+\b/g, (w) => dict[w] || w);
+        } catch (_) {
+            return packed;
+        }
+    }
+
+    function collectM3u8Candidates(text) {
+        const body = decodeEscapedUrl(text || "");
+        if (!body) return [];
+
+        const candidates = new Set();
+        const patterns = [
+            /(?:file|src|source|hls|playlist|video_url|play_url)\s*[:=]\s*["']([^"'\n\r]+?\.m3u8[^"'\n\r]*)["']/gi,
+            /["']((?:https?:)?\/\/[^"'\s]+?\.m3u8[^"'\s]*)["']/gi,
+            /["']((?:\/?[^"'\s]+?\.m3u8[^"'\s]*))["']/gi
+        ];
+
+        for (const rx of patterns) {
+            let m;
+            while ((m = rx.exec(body)) !== null) {
+                const u = String(m[1] || "").trim();
+                if (u && /\.m3u8(\?|$)/i.test(u)) candidates.add(u);
+            }
+        }
+
+        return Array.from(candidates);
+    }
+
+    function streamQualityFromUrl(url) {
+        const u = String(url || "").toLowerCase();
+        if (u.includes("/2160p/") || u.includes("/4k/")) return "2160p";
+        if (u.includes("/1440p/")) return "1440p";
+        if (u.includes("/1080p/") || u.includes("source1280")) return "1080p";
+        if (u.includes("/720p/") || u.includes("source842")) return "720p";
+        if (u.includes("/480p/")) return "480p";
+        if (u.includes("/360p/")) return "360p";
+        return "Auto";
+    }
+
+    function qualityPriority(value) {
+        const q = String(value || "").toLowerCase();
+        if (q === "auto") return 0;
+        if (q === "4k" || q === "uhd" || q === "2160p") return 2160;
+        const m = q.match(/(\d{3,4})p/);
+        return m ? parseInt(m[1], 10) : 1;
+    }
+
     function uniqueByUrl(items) {
         const out = [];
         const seen = new Set();
@@ -113,46 +202,145 @@
         return out;
     }
 
-    function toItemFromApi(video) {
-        if (!video || !video.id) return null;
-        const id = String(video.id);
-        const title = String(video.title || id);
-        const posterUrl = String(video.thumbnail || "");
+    function isCloudflareBlocked(response, targetUrl) {
+        const body = String(response?.body || "");
+        const title = (body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || "").toLowerCase();
+        const urlText = String(targetUrl || "").toLowerCase();
+        if (/cloudflare/i.test(body) && /attention required|verify you are human|just a moment|cf-ray|cf-chl/i.test(body)) return true;
+        if (title.includes("just a moment") || title.includes("attention required")) return true;
+        if (urlText.includes("/cdn-cgi/challenge-platform/")) return true;
+        return false;
+    }
 
-        const meta = [];
-        if (video.code) meta.push(String(video.code));
-        if (video.quality) meta.push(String(video.quality));
-        if (video.duration) meta.push(String(video.duration));
+    async function request(url, headers = {}) {
+        return http_get(url, { headers: Object.assign({}, BASE_HEADERS, headers) });
+    }
+
+    async function loadDoc(url, headers = {}) {
+        const res = await request(url, headers);
+        const finalUrl = String(res?.finalUrl || res?.url || url || "");
+        if (isCloudflareBlocked(res, finalUrl)) {
+            throw new Error(`CLOUDFLARE_BLOCKED: ${finalUrl}`);
+        }
+        return await parseHtml(res.body);
+    }
+
+    function parseVideoCard(el) {
+        if (!el) return null;
+
+        const titleEl = el.querySelector(".my-2 a") || el.querySelector("h2.text-secondary a") || el.querySelector("a[href]");
+        const href = normalizeUrl(getAttr(titleEl, "href"), manifest.baseUrl);
+        if (!href) return null;
+
+        const id = extractVideoId(href);
+        if (!id) return null;
+
+        const img = el.querySelector("img");
+        const posterUrl = normalizeUrl(getAttr(img, "data-src", "src"), manifest.baseUrl);
+        const title = textOf(titleEl) || getAttr(img, "alt") || id;
+
+        if (!title || title.toLowerCase() === "home") return null;
+
+        const code = textOf(el.querySelector(".absolute.top-1.left-1"));
+        const duration = textOf(el.querySelector(".absolute.bottom-1.right-1"));
+        const quality = textOf(el.querySelector(".absolute.top-1.right-1"));
+        const description = [code, quality, duration].filter(Boolean).join(" | ");
 
         return new MultimediaItem({
             title,
-            url: `${manifest.baseUrl.replace(/\/+$/, "")}/en/${id}`,
+            url: href,
             posterUrl,
-            description: meta.join(" | "),
+            description,
             type: "movie",
             contentType: "movie"
         });
     }
 
-    async function request(url, headers = {}) {
-        return http_get(url, {
-            headers: Object.assign({
-                "User-Agent": UA,
-                "Accept": "application/json",
-                "Referer": `${API_BASE}/`
-            }, headers)
-        });
+    function collectItems(doc) {
+        const selectors = [
+            ".thumbnail",
+            "div.grid.grid-cols-2 > div",
+            "div.thumbnail.group"
+        ];
+
+        const items = [];
+        for (const sel of selectors) {
+            const nodes = Array.from(doc.querySelectorAll(sel));
+            for (const node of nodes) {
+                const item = parseVideoCard(node);
+                if (item) items.push(item);
+            }
+            if (items.length >= 24) break;
+        }
+        return uniqueByUrl(items);
     }
 
-    async function apiGet(path) {
-        const url = `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
-        const res = await request(url);
-        const body = String(res?.body || "");
-        try {
-            return JSON.parse(body);
-        } catch (_) {
-            throw new Error(`API_INVALID_JSON: ${url}`);
+    async function fetchListByPaths(paths) {
+        for (const path of paths) {
+            try {
+                const url = path.startsWith("http") ? path : `${manifest.baseUrl}${path}`;
+                const doc = await loadDoc(url);
+                const items = collectItems(doc);
+                if (items.length > 0) return items;
+            } catch (_) {}
         }
+        return [];
+    }
+
+    function parseDetailRows(doc) {
+        const rows = {};
+        const section = doc.querySelector(".space-y-2");
+        if (!section) return rows;
+
+        const blocks = Array.from(section.querySelectorAll("div.text-secondary"));
+        for (const div of blocks) {
+            const labelSpan = div.querySelector("span");
+            if (!labelSpan) continue;
+
+            const label = textOf(labelSpan).replace(/[：:]+/g, "").trim().toLowerCase();
+            if (!label) continue;
+
+            const links = Array.from(div.querySelectorAll("a")).map((a) => textOf(a)).filter(Boolean);
+            if (links.length > 0) {
+                rows[label] = links;
+                continue;
+            }
+
+            const timeEl = div.querySelector("time");
+            if (timeEl) {
+                rows[label] = textOf(timeEl);
+                continue;
+            }
+
+            let text = textOf(div);
+            const labelText = textOf(labelSpan);
+            if (labelText && text.startsWith(labelText)) {
+                text = text.slice(labelText.length).replace(/^[：: ]+/, "").trim();
+            }
+            rows[label] = text;
+        }
+
+        return rows;
+    }
+
+    function pickScalar(rows, labels) {
+        for (const rawLabel of labels) {
+            const label = String(rawLabel || "").toLowerCase();
+            const v = rows[label];
+            if (Array.isArray(v) && v.length > 0) return String(v[0]);
+            if (typeof v === "string" && v) return v;
+        }
+        return "";
+    }
+
+    function pickList(rows, labels) {
+        for (const rawLabel of labels) {
+            const label = String(rawLabel || "").toLowerCase();
+            const v = rows[label];
+            if (Array.isArray(v)) return v;
+            if (typeof v === "string" && v) return [v];
+        }
+        return [];
     }
 
     async function expandHlsVariants(stream) {
@@ -160,11 +348,9 @@
         if (!/\.m3u8(\?|$)/i.test(baseUrl)) return [stream];
 
         try {
-            const headers = Object.assign({}, stream?.headers || {}, {
-                Referer: stream?.headers?.Referer || `${manifest.baseUrl}/`,
-                "User-Agent": UA
-            });
-            const res = await http_get(baseUrl, { headers });
+            const referer = stream?.headers?.Referer || `${manifest.baseUrl}/`;
+            const headers = Object.assign({}, stream?.headers || {}, { Referer: referer, "User-Agent": UA });
+            const res = await request(baseUrl, headers);
             const text = String(res?.body || "");
             if (!/#EXT-X-STREAM-INF/i.test(text)) return [stream];
 
@@ -175,26 +361,20 @@
             for (let i = 0; i < lines.length; i += 1) {
                 const line = String(lines[i] || "").trim();
                 if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
-
                 const nextLine = String(lines[i + 1] || "").trim();
                 if (!nextLine || nextLine.startsWith("#")) continue;
 
-                const resolution = line.match(/RESOLUTION=\d+x(\d+)/i);
-                const quality = resolution?.[1] ? `${resolution[1]}p` : "Auto";
+                const resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+                const quality = resMatch?.[1] ? `${resMatch[1]}p` : "Auto";
 
-                let variantUrl = "";
-                try {
-                    variantUrl = new URL(nextLine, baseUrl).toString();
-                } catch (_) {
-                    continue;
-                }
-
+                const variantUrl = resolveUrl(baseUrl, nextLine);
                 if (!variantUrl || seen.has(variantUrl)) continue;
                 seen.add(variantUrl);
+
                 variants.push(new StreamResult({
                     url: variantUrl,
                     quality,
-                    source: `MissAV API - ${quality}`,
+                    source: `MissAV - ${quality}`,
                     headers
                 }));
             }
@@ -204,7 +384,7 @@
             variants.push(new StreamResult({
                 url: baseUrl,
                 quality: "Auto",
-                source: "MissAV API - Auto",
+                source: "MissAV - Auto",
                 headers
             }));
             return variants;
@@ -215,28 +395,27 @@
 
     async function getHome(cb) {
         try {
-            const data = {};
-            const [homeRes, latestRes, trendingRes, uncensoredRes] = await Promise.allSettled([
-                apiGet("/api/home?page=1"),
-                apiGet("/api/latest?page=1"),
-                apiGet("/api/trending?page=1"),
-                apiGet("/api/uncensored?page=1")
+            const [recommended, latest, trending, uncensored] = await Promise.all([
+                fetchListByPaths(["/", "/en", "/new?page=1"]),
+                fetchListByPaths(["/new?page=1", "/en/new?page=1"]),
+                fetchListByPaths(["/today-hot?page=1", "/dm263/en/today-hot?sort=views"]),
+                fetchListByPaths(["/uncensored?page=1", "/genres/Uncensored?page=1", "/tags/uncensored?page=1", "/search/uncensored?page=1"])
             ]);
 
-            const home = homeRes.status === "fulfilled" ? homeRes.value : null;
-            const latest = latestRes.status === "fulfilled" ? latestRes.value : null;
-            const trending = trendingRes.status === "fulfilled" ? trendingRes.value : null;
-            const uncensored = uncensoredRes.status === "fulfilled" ? uncensoredRes.value : null;
+            const data = {};
+            if (recommended.length > 0) data.Recommended = recommended.slice(0, 24);
+            if (latest.length > 0) data["New Release"] = latest.slice(0, 24);
+            if (trending.length > 0) data.Trending = trending.slice(0, 24);
+            if (uncensored.length > 0) data.Uncensored = uncensored.slice(0, 24);
 
-            const recommended = uniqueByUrl((home?.data || []).map(toItemFromApi).filter(Boolean)).slice(0, 24);
-            const newRelease = uniqueByUrl((latest?.data || []).map(toItemFromApi).filter(Boolean)).slice(0, 24);
-            const hot = uniqueByUrl((trending?.data || []).map(toItemFromApi).filter(Boolean)).slice(0, 24);
-            const uncensoredItems = uniqueByUrl((uncensored?.data || []).map(toItemFromApi).filter(Boolean)).slice(0, 24);
-
-            if (recommended.length > 0) data.Recommended = recommended;
-            if (newRelease.length > 0) data["New Release"] = newRelease;
-            if (hot.length > 0) data.Trending = hot;
-            if (uncensoredItems.length > 0) data.Uncensored = uncensoredItems;
+            if (Object.keys(data).length === 0) {
+                cb({
+                    success: false,
+                    errorCode: "HOME_EMPTY",
+                    message: "No items found from source pages (likely blocked by Cloudflare)."
+                });
+                return;
+            }
 
             cb({ success: true, data });
         } catch (e) {
@@ -248,8 +427,8 @@
         try {
             const normalized = normalizeSearchQuery(query);
             const encoded = encodeURIComponent(normalized);
-            const res = await apiGet(`/api/search?q=${encoded}&page=1`);
-            const items = uniqueByUrl((res?.data || []).map(toItemFromApi).filter(Boolean));
+            const doc = await loadDoc(`${manifest.baseUrl}/search/${encoded}?page=1`);
+            const items = collectItems(doc);
             cb({ success: true, data: items });
         } catch (e) {
             cb({ success: false, errorCode: "SEARCH_ERROR", message: String(e?.message || e) });
@@ -258,30 +437,41 @@
 
     async function load(url, cb) {
         try {
-            const id = extractVideoId(url);
-            if (!id) throw new Error("VIDEO_ID_MISSING");
+            const target = /^https?:\/\//i.test(String(url || ""))
+                ? String(url)
+                : `${manifest.baseUrl.replace(/\/+$/, "")}/${String(url || "").replace(/^\/+/, "")}`;
 
-            const res = await apiGet(`/api/video?id=${encodeURIComponent(id)}`);
-            const details = res?.data;
-            if (!details) throw new Error(`VIDEO_NOT_FOUND: ${id}`);
+            const doc = await loadDoc(target);
+            const title = textOf(doc.querySelector("h1.text-base")) || textOf(doc.querySelector("h1"));
+            const posterUrl = normalizeUrl(
+                getAttr(doc.querySelector("meta[property='og:image']"), "content") || getAttr(doc.querySelector("img"), "data-src", "src"),
+                manifest.baseUrl
+            );
 
-            const title = String(details.title || id);
-            const posterUrl = "";
-            const tags = uniqueStrings([...(details.genres || []), ...(details.tags || [])]);
-            const actors = uniqueStrings(details.actresses || []);
-            const year = parseYear(details.release_date);
-            const duration = details.duration ? String(details.duration) : null;
+            const rows = parseDetailRows(doc);
+            const releaseDate = pickScalar(rows, ["release date", "date", "發行日期", "発売日"]);
+            const durationText = pickScalar(rows, ["duration", "length", "長度", "时长", "時間"]);
+            const studio = pickScalar(rows, ["studio", "maker", "發行商", "メーカー", "製作商"]);
+            const label = pickScalar(rows, ["label", "標籤", "レーベル"]);
+            const genres = pickList(rows, ["genre", "genres", "類型", "ジャンル"]);
+            const actresses = pickList(rows, ["actress", "actresses", "女優", "出演者", "演員"]);
+            const tagsExtra = pickList(rows, ["tags", "tag", "標籤"]);
 
-            const descriptionParts = [];
-            if (details.release_date) descriptionParts.push(`Release Date: ${details.release_date}`);
-            if (details.duration) descriptionParts.push(`Duration: ${details.duration}`);
-            if (details.studio) descriptionParts.push(`Studio: ${details.studio}`);
-            if (details.label) descriptionParts.push(`Label: ${details.label}`);
-            const description = descriptionParts.join(" | ");
+            const tags = uniqueStrings([...(genres || []), ...(tagsExtra || [])]);
+            const actors = uniqueStrings(actresses || []);
+            const year = parseYear(releaseDate);
+            const duration = durationText ? String(durationText) : null;
+            const description = [
+                releaseDate ? `Release Date: ${releaseDate}` : "",
+                duration ? `Duration: ${duration}` : "",
+                studio ? `Studio: ${studio}` : "",
+                label ? `Label: ${label}` : ""
+            ].filter(Boolean).join(" | ");
 
+            const cleanTitle = title || extractVideoId(target) || "MissAV";
             const item = new MultimediaItem({
-                title,
-                url,
+                title: cleanTitle,
+                url: target,
                 posterUrl,
                 description,
                 type: "movie",
@@ -291,8 +481,8 @@
                 tags,
                 actors,
                 episodes: [new Episode({
-                    name: title,
-                    url: `${manifest.baseUrl.replace(/\/+$/, "")}/en/${id}`,
+                    name: cleanTitle,
+                    url: target,
                     season: 1,
                     episode: 1,
                     posterUrl
@@ -307,46 +497,59 @@
 
     async function loadStreams(url, cb) {
         try {
-            const id = extractVideoId(url);
-            if (!id) throw new Error("VIDEO_ID_MISSING");
+            const target = /^https?:\/\//i.test(String(url || ""))
+                ? String(url)
+                : `${manifest.baseUrl.replace(/\/+$/, "")}/${String(url || "").replace(/^\/+/, "")}`;
 
-            const res = await apiGet(`/api/video?id=${encodeURIComponent(id)}`);
-            const details = res?.data || {};
+            const res = await request(target, { Referer: `${manifest.baseUrl}/` });
+            const html = String(res?.body || "");
+            const finalUrl = String(res?.finalUrl || res?.url || target || "");
 
-            const rawCandidates = [];
-            if (Array.isArray(details.streamVariants)) rawCandidates.push(...details.streamVariants);
-            if (details.streamUrl) rawCandidates.push(details.streamUrl);
-
-            const referer = `${manifest.baseUrl}/`;
-            const directStreams = [];
-            const seen = new Set();
-
-            for (const raw of rawCandidates) {
-                const cleaned = cleanupStreamUrl(raw, referer);
-                if (!cleaned || seen.has(cleaned)) continue;
-                seen.add(cleaned);
-                directStreams.push(new StreamResult({
-                    url: cleaned,
-                    quality: streamQualityFromUrl(cleaned),
-                    source: "MissAV API",
-                    headers: { Referer: referer, "User-Agent": UA }
-                }));
+            if (isCloudflareBlocked(res, finalUrl)) {
+                throw new Error(`CLOUDFLARE_BLOCKED: ${finalUrl}`);
             }
 
-            if (directStreams.length === 0) {
-                throw new Error(`STREAM_NOT_FOUND: ${id}`);
+            const referer = finalUrl || target || `${manifest.baseUrl}/`;
+            const streams = [];
+            const seen = new Set();
+
+            const addStream = (rawUrl, sourceName) => {
+                const cleaned = cleanupStreamUrl(rawUrl, referer);
+                if (!cleaned || seen.has(cleaned)) return;
+                seen.add(cleaned);
+                streams.push(new StreamResult({
+                    url: cleaned,
+                    quality: streamQualityFromUrl(cleaned),
+                    source: sourceName,
+                    headers: { Referer: referer, "User-Agent": UA }
+                }));
+            };
+
+            const packedRegex = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\([\s\S]*?\)\)/g;
+            let packed;
+            while ((packed = packedRegex.exec(html)) !== null) {
+                const unpacked = unpackJs(packed[0]);
+                for (const u of collectM3u8Candidates(unpacked)) addStream(u, "MissAV Packed");
+            }
+
+            if (streams.length === 0) {
+                for (const u of collectM3u8Candidates(html)) addStream(u, "MissAV Fallback");
+            }
+
+            if (streams.length === 0) {
+                throw new Error("STREAM_NOT_FOUND");
             }
 
             const expanded = [];
-            for (const stream of directStreams) {
+            for (const stream of streams) {
                 const variants = await expandHlsVariants(stream);
                 expanded.push(...variants);
             }
 
-            const finalStreams = uniqueByUrl(expanded)
+            const output = uniqueByUrl(expanded)
                 .sort((a, b) => qualityPriority(b.quality) - qualityPriority(a.quality));
 
-            cb({ success: true, data: finalStreams });
+            cb({ success: true, data: output });
         } catch (e) {
             cb({ success: false, errorCode: "STREAM_ERROR", message: String(e?.message || e) });
         }

@@ -1,10 +1,9 @@
 {
   "packageName": "kai.delta.missav",
   "name": "MissAV",
-  "version": 5,
+  "version": 6,
   "baseUrl": "https://missav.ws",
-  "apiBaseUrl": "https://missab-seven.vercel.app",
-  "description": "Ported MissAV plugin from CloudStream (GizliKeyif).",
+  "description": "Direct MissAV scraper with adaptive HLS stream extraction.",
   "authors": [
     "kai"
   ],
