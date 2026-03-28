@@ -281,25 +281,48 @@
 
     async function getHome(cb) {
         try {
-            const home = await loadDoc(manifest.baseUrl);
-            const series = collectItems(home).filter((x) => x.contentType === "series").slice(0, 30);
-
-            const episodesDoc = await loadDoc(`${manifest.baseUrl}/tum-bolumler/`);
-            const latestEpisodes = collectItems(episodesDoc).slice(0, 30);
-
-            const moviesDoc = await loadDoc(`${manifest.baseUrl}/tum-yabanci-filmler-hd2/`);
-            const movies = collectItems(moviesDoc).map((x) => new MultimediaItem({
-                title: x.title,
-                url: x.url,
-                posterUrl: x.posterUrl,
-                type: "movie",
-                contentType: "movie"
-            })).slice(0, 30);
-
             const data = {};
-            if (series.length) data["Latest Series"] = series;
-            if (latestEpisodes.length) data["Latest Episodes"] = latestEpisodes;
-            if (movies.length) data["Movies"] = movies;
+            const sections = [
+                { name: "Latest Series", path: "/", type: "series" },
+                { name: "Latest Episodes", path: "/tum-bolumler/", type: "series" },
+                { name: "Epic Series", path: "/efsane-diziler-hd2/", fallbackPath: "/efsane-diziler-hd1/", type: "series" },
+                { name: "Netflix", path: "/netflix-dizileri-hd1/", type: "series" },
+                { name: "Korean", path: "/kore-dizileri-hd1/", type: "series" },
+                { name: "Anime", path: "/anime-dizileri-hd1/", type: "series" },
+                { name: "Japanese", path: "/japon-dizileri-hd1/", type: "series" },
+                { name: "Chinese", path: "/cin-dizileri-hd1/", type: "series" },
+                { name: "Movies", path: "/tum-yabanci-filmler-hd2/", type: "movie" }
+            ];
+
+            for (const section of sections) {
+                let items = [];
+                try {
+                    const doc = await loadDoc(`${manifest.baseUrl}${section.path}`);
+                    items = collectItems(doc);
+                } catch (_) {}
+
+                if (items.length === 0 && section.fallbackPath) {
+                    try {
+                        const fallbackDoc = await loadDoc(`${manifest.baseUrl}${section.fallbackPath}`);
+                        items = collectItems(fallbackDoc);
+                    } catch (_) {}
+                }
+
+                if (section.type === "movie") {
+                    items = items.map((x) => new MultimediaItem({
+                        title: x.title,
+                        url: x.url,
+                        posterUrl: x.posterUrl,
+                        type: "movie",
+                        contentType: "movie"
+                    }));
+                } else if (section.path === "/") {
+                    items = items.filter((x) => isSeriesUrl(x.url) || isEpisodeUrl(x.url));
+                }
+
+                items = uniqueByUrl(items).slice(0, 30);
+                if (items.length > 0) data[section.name] = items;
+            }
 
             cb({ success: true, data });
         } catch (e) {

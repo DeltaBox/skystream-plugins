@@ -1,7 +1,7 @@
 {
   "packageName": "kai.delta.dizigom104",
   "name": "Dizigom104",
-  "version": 1,
+  "version": 2,
   "baseUrl": "https://dizigom104.com",
   "description": "Dizigom104 scraper with direct HLS extraction from watch API and embed player pages.",
   "authors": [
