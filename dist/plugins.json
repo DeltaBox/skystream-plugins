@@ -18,6 +18,25 @@
     "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.anichin.sky"
   },
   {
+    "packageName": "kai.delta.dizigom104",
+    "name": "Dizigom104",
+    "version": 1,
+    "baseUrl": "https://dizigom104.com",
+    "description": "Dizigom104 scraper with direct HLS extraction from watch API and embed player pages.",
+    "authors": [
+      "kai"
+    ],
+    "languages": [
+      "tr",
+      "en"
+    ],
+    "categories": [
+      "TvSeries",
+      "Movie"
+    ],
+    "url": "https://raw.githubusercontent.com/DeltaBox/skystream-plugins/repo/dist/kai.delta.dizigom104.sky"
+  },
+  {
     "packageName": "kai.delta.lk21",
     "name": "LK21",
     "version": 3,
