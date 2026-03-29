@@ -477,18 +477,19 @@
     async function getHome(cb) {
         try {
             const dmCandidates = ["", "dm32", "dm263", "dm628", "dm515", "dm291"];
-            const [recommended, latest, trending, uncensored] = await Promise.all([
-                fetchListByPaths(["/en", "/"], LOCALE_FALLBACKS, dmCandidates),
-                fetchListByPaths(["/en/new?page=1", "/new?page=1"], LOCALE_FALLBACKS, dmCandidates),
-                fetchListByPaths(["/en/today-hot?page=1", "/today-hot?page=1"], LOCALE_FALLBACKS, dmCandidates),
-                fetchListByPaths(["/uncensored-leak?sort=monthly_views", "/search/uncensored?page=1"], LOCALE_FALLBACKS, dmCandidates)
-            ]);
-
+            const sections = [
+                { name: "Recommended", paths: ["/en", "/"] },
+                { name: "Recent", paths: ["/en/new?page=1", "/new?page=1"] },
+                { name: "Trending", paths: ["/en/today-hot?page=1", "/today-hot?page=1"] },
+                { name: "Uncensored", paths: ["/uncensored-leak?sort=monthly_views", "/search/uncensored?page=1"] }
+            ];
             const data = {};
-            if (recommended.length > 0) data.Recommended = recommended.slice(0, 24);
-            if (latest.length > 0) data["New Release"] = latest.slice(0, 24);
-            if (trending.length > 0) data.Trending = trending.slice(0, 24);
-            if (uncensored.length > 0) data.Uncensored = uncensored.slice(0, 24);
+            for (const section of sections) {
+                try {
+                    const items = await fetchListByPaths(section.paths, LOCALE_FALLBACKS, dmCandidates);
+                    if (items.length > 0) data[section.name] = items.slice(0, 24);
+                } catch (_) {}
+            }
 
             if (Object.keys(data).length === 0) {
                 cb({
