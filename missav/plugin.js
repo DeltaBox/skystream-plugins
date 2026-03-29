@@ -169,15 +169,23 @@
 
     function unpackJs(packed) {
         try {
-            const match = packed.match(/}\s*\(\s*(['"].+?['"])\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"].+?['"])\.split\(['"]\|['"]\)/);
+            let match = packed.match(/}\s*\(\s*'((?:\\.|[^'])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\.|[^'])*)'\.split\('\|'\)/);
+            if (!match) {
+                match = packed.match(/}\s*\(\s*"((?:\\.|[^"])*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"((?:\\.|[^"])*)"\.split\("\|"\)/);
+            }
             if (!match) return packed;
 
-            let p = match[1];
+            let p = String(match[1] || "")
+                .replace(/\\'/g, "'")
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, "\\");
             const a = parseInt(match[2], 10);
             let c = parseInt(match[3], 10);
-            const k = match[4].slice(1, -1).split("|");
-
-            if (p.startsWith("'") || p.startsWith("\"")) p = p.slice(1, -1);
+            const k = String(match[4] || "")
+                .replace(/\\'/g, "'")
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, "\\")
+                .split("|");
 
             const e = (n) => (n < a ? "" : e(parseInt(n / a, 10))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
             const dict = {};
