@@ -284,6 +284,25 @@
         return await parseHtml(res.body);
     }
 
+    function isLikelyVideoId(id) {
+        const normalized = String(id || "").toLowerCase();
+        if (!normalized) return false;
+        if (["home", "new", "contact", "tags", "genres"].includes(normalized)) return false;
+        if (/^(about|faq|terms|privacy|dmca|advertise|support)$/.test(normalized)) return false;
+        if (normalized.includes("/") || normalized.includes("?")) return false;
+        return /^[a-z0-9]+(?:-[a-z0-9]+)+(?:-uncensored-leak)?$/i.test(normalized);
+    }
+
+    function shouldSkipCard(href, title, posterUrl) {
+        const hrefText = String(href || "").toLowerCase();
+        const titleText = String(title || "").trim().toLowerCase();
+        if (!posterUrl) return true;
+        if (!titleText || ["home", "recent update", "contact"].includes(titleText)) return true;
+        if (/\/(?:new|contact|dmca|about|faq|terms|privacy|support)(?:[/?#]|$)/i.test(hrefText)) return true;
+        if (/\/(?:search|tags?|genres?|actresses?)\b/i.test(hrefText)) return true;
+        return false;
+    }
+
     function parseVideoCard(el) {
         if (!el) return null;
 
@@ -292,13 +311,12 @@
         if (!href) return null;
 
         const id = extractVideoId(href);
-        if (!id) return null;
+        if (!isLikelyVideoId(id)) return null;
 
         const img = el.querySelector("img");
         const posterUrl = normalizeUrl(getAttr(img, "data-src", "src"), manifest.baseUrl);
         const title = textOf(titleEl) || getAttr(img, "alt") || id;
-
-        if (!title || title.toLowerCase() === "home") return null;
+        if (shouldSkipCard(href, title, posterUrl)) return null;
 
         const code = textOf(el.querySelector(".absolute.top-1.left-1"));
         const duration = textOf(el.querySelector(".absolute.bottom-1.right-1"));
