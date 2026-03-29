@@ -58,7 +58,7 @@
   {
     "packageName": "kai.delta.missav",
     "name": "MissAV",
-    "version": 8,
+    "version": 9,
     "baseUrl": "https://missav.ws",
     "description": "Direct MissAV scraper with adaptive HLS stream extraction.",
     "authors": [
