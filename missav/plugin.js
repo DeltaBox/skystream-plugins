@@ -261,6 +261,32 @@
         return out;
     }
 
+    function buildDetailCandidates(inputUrl) {
+        const raw = String(inputUrl || "").trim();
+        const id = extractVideoId(raw);
+        const localeFromInput = extractLocale(raw) || "en";
+        const dmFromInput = extractDm(raw);
+        const dmCandidates = uniqueStrings([dmFromInput, "", "dm78", "dm32", "dm263", "dm628", "dm515", "dm291"]);
+        const localeCandidates = uniqueStrings([localeFromInput, "en", "id", "ja"]);
+
+        const candidates = [];
+        if (raw) candidates.push(raw);
+        if (id) {
+            for (const dm of dmCandidates) {
+                for (const locale of localeCandidates) {
+                    candidates.push(toSourceUrl(`/${id}`, locale, dm));
+                }
+            }
+        } else if (raw) {
+            for (const dm of dmCandidates) {
+                for (const locale of localeCandidates) {
+                    candidates.push(toSourceUrlFromInput(toSourceUrl(raw, locale, dm)));
+                }
+            }
+        }
+        return uniqueStrings(candidates);
+    }
+
     function isCloudflareBlocked(response, targetUrl) {
         const body = String(response?.body || "");
         const title = (body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || "").toLowerCase();
@@ -530,9 +556,24 @@
 
     async function load(url, cb) {
         try {
-            const target = toSourceUrlFromInput(url);
+            const candidates = buildDetailCandidates(url);
+            let target = toSourceUrlFromInput(url);
+            let doc = null;
+            let lastErr = null;
+            for (const candidate of candidates) {
+                try {
+                    const parsed = await loadDoc(candidate);
+                    const h1 = textOf(parsed.querySelector("h1.text-base")) || textOf(parsed.querySelector("h1"));
+                    if (!h1) continue;
+                    doc = parsed;
+                    target = candidate;
+                    break;
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            if (!doc) throw (lastErr || new Error("DETAIL_NOT_FOUND"));
 
-            const doc = await loadDoc(target);
             const title = textOf(doc.querySelector("h1.text-base")) || textOf(doc.querySelector("h1"));
             const posterUrl = normalizeUrl(
                 getAttr(doc.querySelector("meta[property='og:image']"), "content") || getAttr(doc.querySelector("img"), "data-src", "src"),
