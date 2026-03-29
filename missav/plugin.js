@@ -394,6 +394,43 @@
         return [];
     }
 
+    function withPage(path, page) {
+        const raw = String(path || "").trim();
+        if (!raw) return raw;
+        if (/([?&])page=\d+/i.test(raw)) {
+            return raw.replace(/([?&])page=\d+/i, `$1page=${page}`);
+        }
+        const joiner = raw.includes("?") ? "&" : "?";
+        return `${raw}${joiner}page=${page}`;
+    }
+
+    async function fetchListByPathsPaginated(
+        paths,
+        locales = LOCALE_FALLBACKS,
+        dmCandidates = [""],
+        maxPages = 1,
+        targetCount = 24
+    ) {
+        const all = [];
+        const seen = new Set();
+        const pages = Math.max(1, Number(maxPages) || 1);
+        const want = Math.max(1, Number(targetCount) || 24);
+
+        for (let page = 1; page <= pages; page += 1) {
+            const pagePaths = paths.map((p) => withPage(p, page));
+            const items = await fetchListByPaths(pagePaths, locales, dmCandidates);
+            for (const item of items) {
+                const key = String(item?.url || "").trim();
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                all.push(item);
+                if (all.length >= want) return all;
+            }
+            if (items.length === 0) break;
+        }
+        return all;
+    }
+
     function parseDetailRows(doc) {
         const rows = {};
         const section = doc.querySelector(".space-y-2");
@@ -504,15 +541,22 @@
         try {
             const dmCandidates = ["", "dm32", "dm263", "dm628", "dm515", "dm291"];
             const sections = [
-                { name: "Recommended", paths: ["/en", "/"] },
-                { name: "Recent", paths: ["/en/new?page=1", "/new?page=1"] },
-                { name: "Trending", paths: ["/en/today-hot?page=1", "/today-hot?page=1"] },
-                { name: "Uncensored", paths: ["/uncensored-leak?sort=monthly_views", "/search/uncensored?page=1"] }
+                { name: "Recommended", paths: ["/en", "/"], maxPages: 2 },
+                { name: "Recent", paths: ["/en/new?page=1", "/new?page=1"], maxPages: 3 },
+                { name: "Trending", paths: ["/en/today-hot?page=1", "/today-hot?page=1"], maxPages: 2 },
+                { name: "Uncensored", paths: ["/search/uncensored?page=1", "/uncensored?page=1"], maxPages: 3 },
+                { name: "Uncensored Leak", paths: ["/uncensored-leak?sort=monthly_views&page=1", "/uncensored-leak?page=1"], maxPages: 3 }
             ];
             const data = {};
             for (const section of sections) {
                 try {
-                    const items = await fetchListByPaths(section.paths, LOCALE_FALLBACKS, dmCandidates);
+                    const items = await fetchListByPathsPaginated(
+                        section.paths,
+                        LOCALE_FALLBACKS,
+                        dmCandidates,
+                        section.maxPages,
+                        24
+                    );
                     if (items.length > 0) data[section.name] = items.slice(0, 24);
                 } catch (_) {}
             }
