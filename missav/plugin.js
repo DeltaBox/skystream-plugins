@@ -635,6 +635,7 @@
 
             const tags = uniqueStrings([...(genres || []), ...(tagsExtra || [])]);
             const actors = uniqueStrings(actresses || []);
+            const cast = actors.map((name) => ({ name: String(name || "") })).filter((x) => x.name);
             const year = parseYear(releaseDate);
             const duration = durationText ? String(durationText) : null;
             const description = [
@@ -655,7 +656,7 @@
                 year,
                 duration,
                 tags,
-                actors,
+                cast,
                 episodes: [new Episode({
                     name: cleanTitle,
                     url: target,
